@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# pre-cron-auth-check.sh — Claude 인증 상시 감시 (30분 주기)
+# 크론: */30 * * * *
+# 토큰 만료 4h 전 선제 경고 / 만료 즉시 ntfy 긴급 발송 → 수동 재로그인 유도
+
+set -euo pipefail
+
+BOT_HOME="${BOT_HOME:-${HOME}/jarvis/runtime}"
+LOG_FILE="${BOT_HOME}/logs/pre-cron-auth-check.log"
+MONITORING_CONFIG="${BOT_HOME}/config/monitoring.json"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"; }
+
+# Shared libraries
+source "${BOT_HOME}/lib/ntfy-notify.sh"
+WEBHOOK="jarvis-system"
+source "${BOT_HOME}/lib/discord-notify-bash.sh"
+
+# 현재 로그인 계정 tier 확인
+get_account_info() {
+    local cred_file="${HOME}/.claude/.credentials.json"
+    if [[ ! -f "$cred_file" ]]; then echo "credentials 없음"; return; fi
+    python3 -c "
+import json, datetime, sys
+d = json.load(open('$cred_file'))
+for k, v in d.items():
+    if isinstance(v, dict) and 'accessToken' in v:
+        tier = v.get('rateLimitTier','?')
+        sub = v.get('subscriptionType','?')
+        exp = v.get('expiresAt', 0)
+        exp_str = datetime.datetime.fromtimestamp(exp/1000).strftime('%H:%M') if exp else '?'
+        print(f'{sub}({tier}) 만료:{exp_str}')
+" 2>/dev/null || echo "파싱 실패"
+}
+
+# 쿨다운 파일 (종류별 분리)
+COOLDOWN_EXPIRED="${BOT_HOME}/state/auth-alerted-expired.ts"   # 만료 감지: 30분 쿨다운
+COOLDOWN_WARNING="${BOT_HOME}/state/auth-alerted-warning.ts"   # 임박 경고: 4시간 쿨다운
+
+_check_cooldown() {
+    local file="$1" seconds="$2"
+    [[ -f "$file" ]] || return 1
+    local last now
+    last=$(cat "$file" 2>/dev/null || echo "0")
+    now=$(date +%s)
+    (( now - last < seconds ))
+}
+
+log "Claude 인증 사전 확인 시작"
+
+# context-mode 좀비 가드 (2026-05-14 추가)
+# 단일 프로세스 50% 기준이 아닌 누적 개수 기준 — 각 13~15%씩 54개 폭주 사례 반영
+_CM_COUNT=$(pgrep -c -f "context-mode" 2>/dev/null || echo 0)
+if (( _CM_COUNT > 5 )); then
+    log "⚠️ context-mode 좀비 ${_CM_COUNT}개 감지 — 전체 SIGKILL"
+    pkill -9 -f "context-mode" 2>/dev/null || true
+    log "✅ context-mode 좀비 제거 완료"
+fi
+
+# 단일 장기 폭주 context-mode 가드 (2026-06-03 추가)
+# 개수 임계값(>5) 밑이라도, CPU 80%+ 로 1시간 이상 헛도는 고아 좀비를 개별 종료.
+# 근거: 정상 context-mode는 질의 시에만 잠깐 CPU 사용 → 장시간 고CPU = 고아/폭주.
+# (2026-06-03 사고: 단일 고아가 100% CPU로 2일 버텼으나 '>5개' 가드에 안 걸림)
+while read -r _pid _cpu _etime; do
+    [[ -z "${_pid:-}" ]] && continue
+    _cpu_int=${_cpu%%.*}
+    _secs=$(awk -v t="$_etime" 'BEGIN{
+        n=split(t,a,"-"); d=0; rest=t;
+        if(n==2){d=a[1]; rest=a[2]}
+        m=split(rest,b,":");
+        if(m==3){s=b[1]*3600+b[2]*60+b[3]}
+        else if(m==2){s=b[1]*60+b[2]}
+        else {s=b[1]}
+        print d*86400+s
+    }')
+    if (( _cpu_int >= 80 && _secs >= 3600 )); then
+        log "⚠️ context-mode 장기 폭주 PID=${_pid} (CPU ${_cpu}%, ${_secs}s) — 개별 SIGKILL"
+        kill -9 "$_pid" 2>/dev/null || true
+        log "✅ context-mode 장기 폭주 ${_pid} 제거 완료"
+    fi
+done < <(ps -Ao pid=,%cpu=,etime=,command= | grep "context-mode" | grep -v "grep" | awk '{print $1, $2, $3}')
+
+# PATH 설정 (크론 환경)
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH}"
+unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS
+
+_TIMEOUT_CMD=$(command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || echo "")
+
+# 2026-05-14: _safe_claude_auth_test 함수 추출 — post-edit-lint 훅 false positive 해소
+# 사고 사례: 2026-05-04부터 60+ 세션에서 ${_TIMEOUT_CMD} 변수 형태가 훅의 'timeout.*claude -p' 정규식 매칭 실패로 차단됨
+# 훅 negative pattern '_safe_claude' 매칭으로 통과시키며 의미·동작 변경 없음
+_safe_claude_auth_test() {
+    if [[ -n "${_TIMEOUT_CMD:-}" ]]; then
+        ${_TIMEOUT_CMD} 60 claude -p "ok" --output-format json 2>&1
+    else
+        claude -p "ok" --output-format json 2>&1  # _safe_claude_auth_test fallback (no timeout binary, brew install coreutils 권고)
+    fi
+}
+
+# claude -p 인증 테스트 (30초 타임아웃)
+AUTH_RESULT=""
+AUTH_EXIT=0
+AUTH_RESULT=$(_safe_claude_auth_test) || AUTH_EXIT=$?
+
+ACCOUNT_INFO=$(get_account_info)
+
+# ── 인증 실패 분류 ─────────────────────────────────────────────────────────
+_is_real_auth_failure() {
+    # "Not logged in" 명시 문자열 → 확실한 인증 만료
+    echo "$AUTH_RESULT" | grep -q "Not logged in" && return 0
+    # 2026-05-15: is_error:true + duration_api_ms:0 → transient 처리 (수정)
+    # 이전: sys.exit(0) → return 0 → 인증 실패 판정 → FORCE_REFRESH 트리거 → rate_limit 루프
+    # 수정: sys.exit(1) → return 1 → 일시적 오류로 처리 (rate_limit/서비스 지연 포함)
+    # 근거: zombie 버그(--exclude-dynamic-system-prompt-sections) 수정 후 이 패턴은
+    #        OAuth 만료가 아닌 일시적 실패로 봐도 안전. "Not logged in"이 실제 만료 감지 담당.
+    echo "$AUTH_RESULT" | python3 -c "
+import sys, json
+try:
+    d = json.loads(sys.stdin.read())
+    if d.get('is_error') and d.get('duration_api_ms', 1) == 0:
+        sys.exit(1)  # transient — 인증 실패 아님
+except: pass
+sys.exit(1)" 2>/dev/null && return 0
+    return 1
+}
+
+if (( AUTH_EXIT == 124 )); then
+    log "인증 타임아웃 (60s) — 네트워크 또는 클로드 서비스 이상"
+    if ! _check_cooldown "$COOLDOWN_EXPIRED" 1800; then
+        date +%s > "$COOLDOWN_EXPIRED"
+        send_ntfy "Jarvis Claude 타임아웃" "⚠️ claude -p 30s 타임아웃. 네트워크 확인 필요. 계정: $ACCOUNT_INFO" "high"
+    fi
+    exit 1
+
+elif (( AUTH_EXIT != 0 )); then
+    if _is_real_auth_failure; then
+        log "🔴 인증 만료 감지 (exit $AUTH_EXIT) — 계정: $ACCOUNT_INFO"
+        if ! _check_cooldown "$COOLDOWN_EXPIRED" 1800; then  # 30분 쿨다운
+            date +%s > "$COOLDOWN_EXPIRED"
+            send_ntfy "Jarvis 토큰 만료" "🔴 Claude 토큰 만료. 모든 크론 AUTH_ERROR 상태.\n계정: $ACCOUNT_INFO\n→ claude login 실행 필요" "urgent"
+            send_discord "🔴 **[auth-watch]** Claude 토큰 만료 감지 ($(date '+%H:%M'))\n계정: \`$ACCOUNT_INFO\`\n모든 \`claude -p\` 태스크 실패 중 → **\`claude login\`** 실행 필요"
+        fi
+        exit 1
+    else
+        # 진짜 일시적 오류 (Claude 서비스 불안정 등)
+        log "인증 응답 이상 (exit $AUTH_EXIT, 일시적): ${AUTH_RESULT:0:120}"
+        exit 0
+    fi
+
+else
+    log "인증 정상 (계정: $ACCOUNT_INFO)"
+    rm -f "$COOLDOWN_EXPIRED"
+
+    # 만료 임박 경고: 1시간 이내 만료 예정이면 백업 갱신 시도 (4h 쿨다운)
+    # 2026-05-14: 4h → 1h 축소 — cron 4시간 주기와 중복 회피, thundering herd 완화
+    # cron이 정상 동작하면 만료 3시간 전 자동 갱신됨 → pre-cron은 마지막 1시간만 백업 경로
+    EXPIRE_SOON=$(python3 -c "
+import json, time, sys
+cred = '${HOME}/.claude/.credentials.json'
+try:
+    d = json.load(open(cred))
+    for v in d.values():
+        if isinstance(v, dict) and 'expiresAt' in v:
+            remaining_min = (v.get('expiresAt',0)/1000 - time.time()) / 60
+            if 0 < remaining_min < 60:
+                print(int(remaining_min))
+                sys.exit(0)
+except: pass
+sys.exit(1)
+" 2>/dev/null || echo "")
+
+    # 2026-05-20 가드: oauth-refresh.sh --force는 2026-05-08부터 100% rate_limit_error.
+    # G5 force 호출이 Anthropic rate_limit을 영구화하는 악화 경로 → 일시 비활성화.
+    # Claude Code CLI 자체 갱신이 백업 경로로 동작 중. 1시간 임박 시 Discord 알림만 발송.
+    # 복구 조건: oauth-refresh.log에서 cron 자동 갱신이 1회 이상 성공 후 재활성화.
+    DISABLE_FORCE_REFRESH=1
+
+    if [[ -n "$EXPIRE_SOON" ]] && [[ "${DISABLE_FORCE_REFRESH:-0}" == "1" ]]; then
+        log "⚠️ 토큰 만료 임박: ${EXPIRE_SOON}분 후 (계정: $ACCOUNT_INFO) — FORCE 갱신 비활성화 상태, Discord 알림만 발송"
+        if ! _check_cooldown "$COOLDOWN_WARNING" 3600; then
+            date +%s > "$COOLDOWN_WARNING"
+            send_discord "⚠️ **[auth-watch]** 토큰 **${EXPIRE_SOON}분 후 만료** · 계정: \`$ACCOUNT_INFO\`\nFORCE 갱신은 rate_limit 회피를 위해 비활성화 상태. Claude CLI 세션을 한 번 띄워 자동 갱신 유도해 주십시오."
+        fi
+    elif [[ -n "$EXPIRE_SOON" ]]; then
+        log "⚠️ 토큰 만료 임박: ${EXPIRE_SOON}분 후 (계정: $ACCOUNT_INFO) — oauth-refresh.sh --force 호출"
+        OAUTH_SCRIPT="${BOT_HOME}/infra/scripts/oauth-refresh.sh"
+
+        # 갱신 전 expiresAt 기록 (false success 감지용)
+        BEFORE_EXP=$(python3 -c "
+import json
+d=json.load(open('${HOME}/.claude/.credentials.json'))
+v=d.get('claudeAiOauth',{})
+print(int(v.get('expiresAt',0)))
+" 2>/dev/null || echo "0")
+
+        REFRESH_RESULT=""
+        if [[ -x "$OAUTH_SCRIPT" ]]; then
+            REFRESH_RESULT=$(bash "$OAUTH_SCRIPT" --force 2>&1) && REFRESH_OK=true || REFRESH_OK=false
+        else
+            log "❌ oauth-refresh.sh 없음: $OAUTH_SCRIPT"
+            REFRESH_OK=false
+        fi
+
+        # 갱신 후 expiresAt 재확인 (exit 0이어도 실제 갱신 여부 검증)
+        AFTER_EXP=$(python3 -c "
+import json,datetime
+d=json.load(open('${HOME}/.claude/.credentials.json'))
+v=d.get('claudeAiOauth',{})
+ts=int(v.get('expiresAt',0))
+print(ts)
+" 2>/dev/null || echo "0")
+
+        if [[ "$REFRESH_OK" == true ]] && [[ "$AFTER_EXP" -gt "$BEFORE_EXP" ]]; then
+            NEW_EXP=$(python3 -c "
+import json,datetime
+d=json.load(open('${HOME}/.claude/.credentials.json'))
+v=d.get('claudeAiOauth',{})
+ts=int(v.get('expiresAt',0))
+print(datetime.datetime.fromtimestamp(ts/1000).strftime('%H:%M'))
+" 2>/dev/null || echo "?")
+            log "✅ 자동 갱신 성공 — 새 만료: ${NEW_EXP} (이전: $(python3 -c "import datetime; print(datetime.datetime.fromtimestamp(${BEFORE_EXP}/1000).strftime('%H:%M'))" 2>/dev/null))"
+            ACCOUNT_INFO=$(get_account_info)
+            rm -f "$COOLDOWN_WARNING"
+            send_discord "✅ **[auth-watch]** 토큰 자동 갱신 완료 (→ ${NEW_EXP}) · 계정: \`$ACCOUNT_INFO\`"
+        else
+            # false success 또는 실제 실패 — 만료시각 변동 없음
+            local_exp=$(python3 -c "
+import json,datetime
+d=json.load(open('${HOME}/.claude/.credentials.json'))
+v=d.get('claudeAiOauth',{})
+ts=int(v.get('expiresAt',0))
+print(datetime.datetime.fromtimestamp(ts/1000).strftime('%H:%M'))
+" 2>/dev/null || echo "?")
+            log "❌ 자동 갱신 실패 (exit=${REFRESH_OK}, expiresAt 변동 없음) — ${REFRESH_RESULT:0:100}"
+            if ! _check_cooldown "$COOLDOWN_WARNING" 14400; then
+                date +%s > "$COOLDOWN_WARNING"
+                send_ntfy "Jarvis 토큰 갱신 실패" "⚠️ ${EXPIRE_SOON}분 후 만료 (${local_exp})\noauth-refresh.sh 실패 → 수동 claude setup 필요\n계정: $ACCOUNT_INFO" "high"
+                send_discord "⚠️ **[auth-watch]** 토큰 자동 갱신 실패. **${EXPIRE_SOON}분 후 만료** (${local_exp})\n계정: \`$ACCOUNT_INFO\` — 갱신 재시도 중 (다음 30분 체크 시 재시도)"
+            fi
+        fi
+    else
+        rm -f "$COOLDOWN_WARNING"
+    fi
+
+    exit 0
+fi

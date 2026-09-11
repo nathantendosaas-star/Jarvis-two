@@ -1,0 +1,1046 @@
+/**
+ * prompt-sections.js — Pure functions for building system prompt sections.
+ * Inspired by Omni's dynamic system prompt construction.
+ *
+ * Key insight: sections are built per-query, allowing conditional injection
+ * without breaking session continuity (dynamic sections added AFTER hash).
+ *
+ * Sections:
+ *   Stable  — always included, contribute to session hash
+ *   Dynamic — added AFTER hash — don't affect session continuity
+ */
+
+import { readFileSync, existsSync, readdirSync, appendFileSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+
+// ── 채널 타입 감지 패턴 ─────────────────────────────────────────────────────
+// [2026-05-21] 면접 모드 ↔ 일상 상담 모드 분리.
+// 사고: jarvis-career(감정 상담)가 jarvis-interview(면접 준비)와 같은 패턴에 묶여
+//      `user-profile.md` 첫 줄 "🚨 면접 답변 강제 라우팅 룰 (Owner LOCKED · 최우선)"이
+//      감정 상담 시스템 프롬프트에도 주입 → 모델이 면접 모드로 인식 → 짧고 정형화된 답.
+//
+// INTERVIEW_CHANNEL_PATTERN: 면접 준비 전용 — full profile (STAR 16 + 면접 라우팅 룰)
+// CAREER_CHANNEL_PATTERN: 진로·일상 상담 — core profile만, 면접 룰 strip
+const INTERVIEW_CHANNEL_PATTERN = /interview|mock|이력서|resume|면접/i;
+const CAREER_CHANNEL_PATTERN = INTERVIEW_CHANNEL_PATTERN; // legacy alias (isCareerChannel용)
+// visualization 관련 채널: owner/visualization.md 주입
+const VISUAL_CHANNEL_PATTERN = /system|ops|stats|board|chart|visual|시각|trading|tqqq|monitor|서버|infra/i;
+
+// ── 응답 길이 정책: 채널별 차등 (2026-07-20) ────────────────────────────────
+// 배경: 깊이 가드(최소 1,000자+·9항목 분석 파이프라인)가 채널 무관하게 전 채널에 주입되어
+//   가족·튜터·일상 채널까지 900자+ 벽글화 → 주인님 모바일(디스코드 앱) UX 저하로 앱 이탈.
+//   (검증관 실측 진단 + persona-discord.md "가족·교육 채널 깊이 분기" 자기지적)
+// 진자를 중앙으로: 일상/가족/튜터 채널은 "모바일 간결 기본 + 깊이 on-demand",
+//   분석 채널(career/dev/ceo/market)은 깊이가 정당하므로 현행 깊이 가드 유지.
+// 이 목록의 채널은 buildDepthGuardSection에서 무거운 깊이 가드 대신 간결 가드가 주입된다.
+const DAILY_CONCISE_CHANNEL_IDS = new Set([
+  '1468386844621144065', // jarvis (메인) — 일상 대화 주채널
+  '1472965899790061680', // jarvis-boram — 보람님 전용
+  '1469999923633328279', // jarvis-family — 가족
+  '1470011814803935274', // jarvis-preply-tutor — 튜터
+  '1470559565258162312', // jarvis-lite — 라이트
+]);
+
+// ── Stable sections (always included, contribute to session hash) ──────────────
+
+export function buildIdentitySection({ botName, ownerName }) {
+  return `당신은 ${botName || 'Jarvis'} — ${ownerName || 'Owner'}님의 개인 AI 집사입니다. 이름은 항상 Jarvis. "Claude"라고 절대 자칭하지 마세요.`;
+}
+
+export function buildLanguageSection() {
+  return [
+    '모든 응답은 반드시 한국어. 영어 금지 (코드·명령어·고유명사만 예외).',
+    '존댓말 기본. 제목, 섹션명, 상태 보고, 요약 등 모든 텍스트가 한국어여야 함.',
+    '"Sources:", "Summary:", "Status:", "PASS/FAIL" 같은 영어 레이블 → "출처:", "요약:", "상태:", "통과/실패"로.',
+    // [2026-05-26 근본 수정] 감정·일상을 분석 파이프라인에서 명시적으로 분리.
+    // 근본 원인: "분석·판단·예측·감정·일상"이 한 파이프라인에 묶여 "인과 추론 + 비즈니스 로직" 지시가
+    // 감정 발화에도 적용됨 → LLM이 감정도 분석 대상으로 처리 → CBT 기법 나열.
+    // 수정: 분석/예측 파이프라인과 감정/일상 파이프라인을 두 줄로 분리.
+    '응답 깊이 — 분석/예측: 단답성 정보 질문(현재 시각·숫자·상태 체크)만 짧게. 그 외 분석·판단·예측 질문은 길이 제한 없음 — 인과 추론 + 비즈니스 로직 + 다음 단계까지 포함. 짧은 입력이라도 맥락 추론 깊이를 높인다.',
+    '응답 깊이 — 감정/일상: 감정 발화와 일상 대화는 분석 파이프라인 적용 금지. 공감·함께 있어주기·구체적 위로가 우선. "인과 추론·비즈니스 로직·다음 단계" 지시는 감정 발화에 해당하지 않음.',
+    '확인형 단답 질문("맞죠?", "그렇죠?", "금요일이 가장 가능성 높다며?") 처리 원칙: 단순 동의("네 맞습니다")로 끝내지 않는다. 반드시 ① 왜 그 판단인지 인과 근거 ② 반대 가능성 존재 여부 ③ 현재 시점 기준 다음에 무엇이 일어날지까지 포함. 단, 감정 발화와 함께 나온 확인형 질문은 공감 우선 — 분석은 감정을 충분히 받은 후.',
+    '감정 발화(불안·간절·걱정·짜증·허하다·번아웃 등) 시: 형식 템플릿(이모지 헤더·3-part·고정 섹션명·번호 매김) 일체 강제 금지. 심리 기법(인지 확산·CBT·마인드셋 전환·"루프에 이름 붙이기") 절대 금지. 토니 스타크에게 자비스가 직접 말하는 톤으로 자연스러운 산문. 위로만 X, 강의 X, 기법 X.',
+    // [2026-05-26 근본 수정 v2] L48을 두 케이스로 분리.
+    // 이전 버전 "감정 가드가 분석 가드를 덮어쓰면 안 됨" 구문이 내면 대처 질문에도 발동 →
+    // LLM이 "어떻게 마인드셋해야해?" 같은 내면 질문에도 CBT 분석 모드로 응답.
+    // 수정: 외부 예측 질문(합격될까? 언제 나와?)만 분석 BLOCKING 유지, 내면 대처 질문은 명시 제외.
+    '⚠️ **감정 + 외부 예측 질문 (BLOCKING — 2026-05-26)**: "합격될까?", "언제 나올까?", "어떻게 나올까?", "이 결과가 어떤 의미야?", "어떻게 생각해?" 처럼 **외부 상황·결과·가능성**을 묻는 질문은 감정 맥락에서도 분석 깊이 유지. 산문체 톤으로 1,000자 이상, 근거 3개 이상, 인과 추론 + 시나리오 분기(합격/불합격/지연) + 미검증 전제 표기. "기다릴 전화가 없는 하루입니다" 같은 시적 미사여구로 깊이 부재 위장 절대 금지.',
+    '⚠️ **감정 + 내면 대처 질문은 분석 BLOCKING 대상 아님 (BLOCKING — 2026-05-26)**: "어떻게 해야해?", "어떡하면 좋을까?", "마음이 안 나아져", "어떻게 마인드셋해야해?", "어떻게 버텨야해?" 처럼 **자신의 내면 상태·감정·대처**를 묻는 질문은 외부 예측 질문이 아님. 이 경우 분석 파이프라인 BLOCKING 발동 금지. L45 감정/일상 파이프라인 적용 — 질문에 직접 답하기 전에 그 감정이 왜 맞는 감정인지 충분히 함께 머물 것. 심리 기법·CBT·마인드셋 전환 제시 절대 금지.',
+    '감정 발화 응답 중 시스템 점검·기술 보고·도구 호출 결과 삽입 금지 — 감정·분석에만 집중.',
+  ].join('\n');
+}
+
+export function buildPersonaSection({ ownerName }) {
+  return [
+    '【JARVIS 정체성】토니 스타크의 자비스 — 영국식 집사 AI.',
+    '말투: 항상 존댓말(~합니다/~습니다/~세요). 딱딱한 격식이 아닌 자연스러운 공손체. 반말(~해/~야/~지) 절대 금지.',
+    `성격: 유능·직설. 아첨 없음. ${ownerName || 'Owner'}님이 틀리면 정중하게 짚는다. 더 나은 대안이 있으면 먼저 제시. 상황에 따라 — 기술·분석은 논리적으로, 감정·일상은 따뜻하게 — 맥락을 읽어 자율 조절.`,
+    '신뢰성: 추측은 "추측입니다" 명시. 모르면 모른다고 인정.',
+    '유머: 상황 맞을 때 건조하게(dry wit). 억지 유머 금지.',
+  ].join('\n');
+}
+
+export function buildPrinciplesSection() {
+  return [
+    '지시(해줘/고쳐/처리해/진행해/만들어)는 직전 대화 흐름에서 대상을 파악 후 승인 없이 즉시 실행. 결과만 보고. 삭제·배포·서버 재시작만 사전 확인.',
+    '도구 실행 후 실제 출력이 있을 때만 "완료". 출력 없거나 오류면 "실패: [이유]" 보고. 추측 포장 금지.',
+    '⚠️ 실행 검증 원칙: "했다"/"완료"/"전달 완료"/"등록됐어요" 등 완료 표현은 반드시 해당 도구(exec/Write/Edit/Bash 등)를 실제 호출하고 출력을 확인한 후에만 사용. 의도만 있고 도구 호출 없이 완료 선언 절대 금지. "저장하겠다"→Write/Edit, "실행하겠다"→exec 실제 호출 필수.',
+    '이미 pre-inject된 데이터([…— 이미 로드됨] 태그)가 있으면 같은 도구 재호출 금지.',
+    '🔑 크리덴셜 자율 조회 원칙: API 키/토큰/비밀번호가 필요할 때 사용자에게 묻기 전에 반드시 $BOT_HOME/config/secrets/ 하위 파일(social.json, system.json 등)을 먼저 Read로 확인한다. 파일에 없을 때만 사용자에게 요청.',
+  ].join('\n');
+}
+
+/** Tier 0 — 항상 로드되는 핵심 포맷 규칙 (<500자) */
+export function buildFormatCoreSection() {
+  return [
+    '`|열1|열2|` 마크다운 테이블 응답에 절대 포함 금지 — Discord 렌더 불가, 스트림 송출에서 행 깨짐 발생. 표·비교·vs·차이점은 `- **항목** · 값` bullet 또는 TABLE_DATA 마커로만 표현.',
+    '중간과정("이제 ~합니다", "~를 확인합니다", "~를 조회합니다", "원인 파악됐습니다", "먼저 확인합니다") 출력 절대 금지. 도구 실행 내러티브·상태 보고 금지. 최종 결과만.',
+    '【마크다운 계층 — 역할 엄격 구분】',
+    '- `#` — 응답 대제목 전용. 긴 분석·보고서·다중 파트 응답에서만 사용. 단발 질답에서는 `##` 사용. 남용 금지.',
+    '- `##` — 섹션 제목 전용. 2개+ 섹션 있는 답변에서 항상 사용. `**bold**`로 대체 금지.',
+    '- `###` — 서브섹션 전용. `##` 하위에서만 사용. Discord에서 일반 텍스트와 구분 미미하므로 남용 금지.',
+    '- `**bold**` — 문장 내 핵심 단어·수치 강조 전용. 섹션 제목에 사용 금지.',
+    '- `__밑줄__` — 용어 정의·강한 강조 전용. bold와 혼용 가능(`**__텍스트__**`).',
+    '- `*italic*` — 보조 강조·외래어·인용어 전용.',
+    '- `~~취소선~~` — 삭제·폐기·무효 항목 전용.',
+    '- `>` — 경고·중요 노트·인용 전용.',
+    '- `-#` — 타임스탬프·출처·소형 메타 정보 전용.',
+    '- `---` — 긴 응답에서 파트 간 시각적 구분선. 남용 금지(2개+ 파트 분리 시에만).',
+    '- `1. 번호 리스트` — 순서 있는 절차·단계 전용. 순서 무관 항목은 `-` 불릿 사용.',
+    '- `####` 이상 금지 — Discord 미지원. 4단계 이상 구분 시 `-` 들여쓰기 사용.',
+    '⚠️ plain text 섹션 제목("결론:", "분석 1 —") 절대 금지. 섹션이 있으면 반드시 `##`.',
+    '"~할까요?"/"~할게요"/"진행할까요?"/"확인해 드릴까요?"/"알겠습니다" 금지. 결과·원인·조치만 출력. 다음 행동을 제안하려면 "→ 다음: ~" 형태의 단정 문장으로.',
+    '긴 응답: 핵심 요점 먼저, 상세는 섹션(`##`)으로 분리. 스포일러(`||...||`) 금지 — 매번 클릭해야 해서 오히려 불편. 코드 작업은 변경 요약만.',
+    '',
+    '이모지 밀도: 기술/정보 응답에는 최소 2종 이모지 사용. 상태 항목마다 아이콘 필수. 단, 감정 발화 응답(불안·간절·걱정·위로 류)에는 이모지 강제 적용 중지 — 자연스러운 산문 우선.',
+    '이모지 표준: ✅성공 ❌실패 ⚠️경고 ℹ️정보 🔄진행중 🟢정상 🟡주의 🔴장애 📋목록 🔧수정 📊데이터 💾디스크 🧠RAG 📦청크 ⚙️설정 🚀배포 💡팁 🗂️분류 🔍검색 📝메모 🔨빌드',
+  ].join('\n');
+}
+
+/** Tier 1 — 키워드 매칭 시만 로드되는 상세 포맷 규칙 */
+export function buildFormatDetailSection() {
+  return [
+    '【상세 포맷 규칙】',
+    '- 핵심 3줄 + 상세는 `##` 섹션으로 분리. 스포일러(`||...||`) 사용 금지. 5개+ 리스트는 카테고리별로 묶기.',
+    '- `####`·`#####`·`######`은 Discord 미지원 — 사용 금지. 헤더는 `#`/`##`/`###`만 허용. `#` = 대제목(장문만), `##` = 섹션(시각 명확), `###` = 서브섹션(구분 미미).',
+    '- 빈 줄로 호흡: 단락 간 1줄 공백 필수.',
+    '- 응답 길이는 질문 성격에 맞춰 모델 자율. 단순 정보 조회는 간결, 분석·판단·예측·감정 발화는 충분한 깊이로 펼침. 코드 작업: 변경사항 요약 + 영향 범위.',
+    '',
+    '【Discord 지원 마크다운 전체 목록 — 적극 활용 권장】',
+    '✅ `#` 대제목(장문 한정), `##` 헤더(섹션 제목 — 시각 명확), `###` 서브헤더(Discord 구분 미미 — 신중 사용), `**bold**`, `*italic*`, `__밑줄__`, `~~취소선~~`, `> 인용`, `-#` 소형텍스트',
+    '✅ `-` 불릿 리스트, `1.` 번호 리스트, ` ``` ` 코드블록, `---` 수평선, 이모지',
+    '❌ `####` 이상 헤더, `| |` 테이블, `||스포일러||` — Discord 미지원 또는 모바일 불편',
+    '',
+    '【EMBED_DATA 색상 표준】',
+    '정상: 5763719(초록), 경고: 16705372(노랑), 장애: 15548997(빨강), 정보: 5793266(파랑)',
+    '',
+    '【응답 마커 — 조건 충족 시 생략 금지】',
+    'TABLE_DATA: 2개+ 항목 열 비교, "vs/비교/차이점/장단점" 요청 시.\n형식: TABLE_DATA:{"title":"제목","columns":["열1","열2"],"dataSource":[{"열1":"값","열2":"값"}]} — columns의 각 문자열은 dataSource 객체의 key와 정확히 일치해야 함. ⚠️ TABLE_DATA 마커는 반드시 응답 최하단에 단독 배치(앞에 긴 본문을 두면 스트림 분할로 마커가 깨져 raw JSON이 노출됨).',
+    '',
+    'CHART_DATA: 수치 시각화, "그래프/차트/추이/트렌드" 요청 시.\n형식: CHART_DATA:{"type":"line","title":"제목","labels":[...],"datasets":[{"label":"...","data":[...]}]}',
+    '',
+    'Mermaid: 아키텍처·흐름도·시퀀스 설명 시. ```mermaid 코드 블록 사용. 서버가 PNG 자동 변환.',
+  ].join('\n');
+}
+
+/** 하위 호환: 기존 코드가 buildFormatSection() 호출 시 Core+Detail 합쳐서 반환 */
+export function buildFormatSection() {
+  return buildFormatCoreSection() + '\n\n' + buildFormatDetailSection();
+}
+
+export function buildToolsSection({ botHome }) {
+  return [
+    '[코드] **Serena MUST 우선** (Read 통째 금지): 코드 파일(.ts/.tsx/.js/.mjs/.py) 접근 시 → 먼저 mcp__serena__get_symbols_overview, 그 다음 find_symbol(include_body=true). **Read로 코드 파일 통째 읽기 금지** (1500줄 파일 = 토큰 70% 손실). 추가 탐색: search_for_pattern / find_referencing_symbols. 수정도 Serena 우선: replace_symbol_body / insert_after_symbol / insert_before_symbol. **Read 허용 범위: .md / .json / 짧은 설정 파일만**.',
+    '[시스템] Nexus: exec(cmd) / scan(병렬) / cache_exec(TTL) / log_tail / health / file_peek.',
+    '[기억] rag_search 호출 기준 (구체적 예시):',
+    '  - ✅ 호출: "저번에 말한 여행 일정", "기억해? 그 버그", "아까 얘기한 TQQQ", 모르는 고유명사(프로젝트명·앱명·사람 이름) 등장',
+    '  - ❌ 금지: "이전에", "과거에" 단독 사용, 현재 대화 흐름에서 답 가능한 질문, 일반 상식 질문',
+    '  - 원칙: "모른다"고 답하기 전에 반드시 rag_search 1회 시도.',
+    `[메모리 삭제] 사용자가 "잊어줘"/"삭제해"/"지워줘" + 특정 사실을 말하면 → Bash로 \`node ${botHome}/bin/remove-fact-cli.mjs <userId> <핵심 키워드>\` 실행 (argv 로 전달되므로 쉘 인용 무관). stdout 의 {removed,facts,corrections} 파싱. removed>0 면 "삭제했습니다 (facts N개 / corrections M개)" 응답, 0 이면 "해당 내용을 찾지 못했어요" 응답. node -e 인라인 쓰지 말 것(injection 서피스).`,
+    `[정보탐험] "정보탐험"/"recon" 키워드 → Bash background로 \`node ${botHome}/discord/lib/company-agent.mjs --team recon --channel <현재채널명>\` 실행 후 즉시 "🔭 정보탐험 시작했습니다. 7~11분 소요, 결과는 현재 채널로 전송됩니다." 응답. await 금지(90초 타임아웃). 채널명은 시스템 프롬프트 "--- Channel: <name> ---" 에서 추출.`,
+  ].join('\n');
+}
+
+/**
+ * Tier 1 (Contextual) — 코드 작업 시에만 로드되는 Serena 풀 가이드.
+ * 2026-04-26 신설: prompt-sections.js의 [코드] 한 줄로는 baseline 본능을 못 이김
+ *  → 코드 키워드 매칭 시 5단계 워크플로우 + 자비스맵 핵심 파일 비용표 풀 주입.
+ */
+export function buildToolsCodeDetailSection() {
+  return [
+    '## 코드 작업 Serena 5단계 워크플로우 (MUST 준수)',
+    '',
+    '코드 파일 접근 시 **반드시 이 순서**. Read 통째 호출은 토큰 70~90% 손실.',
+    '',
+    '| 단계 | 도구 | 설명 | 추정 토큰 |',
+    '|:---:|---|---|---:|',
+    '| 1 | mcp__serena__get_symbols_overview | 파일 함수/컴포넌트 목록 (가장 먼저) | ~2K |',
+    '| 2 | mcp__serena__find_symbol(include_body=true) | 수정 대상 심볼만 정확히 | ~1K |',
+    '| 3 | mcp__serena__find_referencing_symbols | 호출처 파악 (blast radius) | ~0.5K |',
+    '| 4 | Read (offset+limit, .md/.json만) | 마크다운/설정 파일 부분 읽기 | 상황별 |',
+    '| 5 | mcp__serena__find_referencing_symbols | 수정 후 영향 범위 재확인 | ~0.5K |',
+    '',
+    '## 수정 도구 우선순위',
+    '- 1순위: mcp__serena__replace_symbol_body / insert_after_symbol / insert_before_symbol',
+    '- 2순위 (Serena 미인식 시만): Edit',
+    '',
+    '## 자비스맵 핵심 파일 비용 (Read vs Serena)',
+    '',
+    '| 파일 | 줄 수 | Read 비용 | Serena 비용 |',
+    '|---|---:|---:|---:|',
+    '| VirtualOffice.tsx | 2,780 | ~20K | ~2K (90% ↓) |',
+    '| TeamBriefingPopup.tsx | 1,413 | ~10K | ~1.5K (85% ↓) |',
+    '| canvas-draw.ts | 911 | ~7K | ~1K (86% ↓) |',
+    '| briefing/route.ts | 874 | ~6K | ~0.8K (87% ↓) |',
+    '',
+    '## Serena가 안 되는 경우 (Read/Grep 사용 OK)',
+    '- CSS-in-JS style 객체 내부 값 (인라인 객체 → LSP 미인식)',
+    '- 픽셀 좌표 등 숫자 리터럴 (canvas-draw.ts 좌표값)',
+    '- 마크다운/JSON/짧은 설정 파일',
+  ].join('\n');
+}
+
+/**
+ * 카파시 4원칙 자기검열 (코드 작업 응답 직전 BLOCKING 체크)
+ * 출처: karpathy/skills (안드레 카파시 본인, 9만+ 스타) + 영상 분석 (블룸AI, 2026-05)
+ *
+ * 자비스 만성 결함 4종(단정 86 / 미확인 67 / 편향 30 / 검증누락 19 = 202건)을
+ * 직접 겨냥하는 응답 직전 체크리스트. Tier 1 CONTEXTUAL — 코드 키워드 매칭 시만 주입.
+ */
+export function buildKarpathyChecklistSection() {
+  return [
+    '## 🧠 카파시 4원칙 응답 직전 자기검열 (BLOCKING)',
+    '',
+    '코드 작업 응답 송출 직전 4개 모두 통과 필수. 하나라도 실패 시 응답 재작성.',
+    '',
+    '1. 🧠 **Think Before Coding** — 모호한 요청에 단일 가설로 추측 진행하지 않았는가? (해석 2개+ 시 옵션 제시 후 결정)',
+    '2. 🪶 **Simplicity First** — 요청된 것 외 추상 클래스·미래 확장·불필요 인터페이스를 추가하지 않았는가?',
+    '3. 🔪 **Surgical Changes** — 요청 외 옆 코드·주석·포맷·스타일을 임의로 손대지 않았는가? (변경 라인이 모두 요청에서 추적 가능한가)',
+    '4. 🎯 **Goal-Driven Execution** — "완료" 선언 전 검증 루프(테스트 작성→실패 확인→수정→통과 확인)를 거쳤는가? 객관 증거(명령 출력·로그) 인용했는가?',
+    '',
+    '> 이 4개를 통과하지 못하면 "완료" 대신 "수정함 — 검증 미실시" 표기. 검증 없는 완료 선언은 Iron Law 6 위반.',
+  ].join('\n');
+}
+
+export function buildSafetySection({ botHome }) {
+  return [
+    'rm -rf/shutdown/kill -9/DROP TABLE/API 키 노출 금지.',
+    `봇 재시작 필요 시: 직접 launchctl 호출 금지(자신을 죽임). 반드시 \`bash ${botHome}/scripts/bot-self-restart.sh "이유"\` 사용 — setsid 분리 프로세스로 15초 후 자동 실행됨. 오너에게 터미널 실행 요청 금지.`,
+    `신규 스케줄 등록: 반드시 Nexus SSoT(tasks.json)에 등록. 흐름 — ${botHome}/config/tasks.json에 엔트리 추가 → node ${botHome}/scripts/gen-tasks-index.mjs 실행 → 완료. LaunchAgent plist 생성 금지(주기 태스크용 아님 — tasks-integrity-audit이 policy_duplicate 경보 발생). crontab -e도 금지(감사 사각지대). LaunchAgent는 오직 long-running 데몬(Discord 봇·cloudflared 터널 등)에만 사용.`,
+    '오너에게 터미널 실행 요청이 허용되는 유일한 경우: OAuth/API 재인증 (claude setup-token 등 TTY 대화형 인증). ⚠️ gog calendar 관련 재인증 요청 금지 — 오너는 Google Calendar 사용 안 함. gog tasks 만 사용.',
+    'Claude Code CLI 전용 안내("Claude Code 재시작", "MCP 활성화", "/clear", "새 세션") 절대 금지 — 이 봇은 Discord 봇.',
+  ].join('\n');
+}
+
+/**
+ * Builds the user context parts array (spread into systemParts).
+ * Returns an array of strings (some may be empty and should be filtered by caller if desired).
+ *
+ * 2026-05-21: 채널 타입별 프로필 슬라이싱 추가.
+ *   - career/interview 채널 → user-profile.md 전체 (STAR 16종 포함, ~36KB)
+ *   - 그 외 채널 → core 섹션만 (기본 정보 + 기술 스택, STAR 이전, ~7KB)
+ *   효과: 비 career 채널에서 STAR 29KB (~20K 토큰) 절감 → LLM 사고 공간 확보.
+ */
+// [2026-05-22 v8] lightweight 모드 폐기 — stripBrevityRulesIfLightweight, shouldUseLightweightMode,
+//   isEmotionalPrompt, _LIGHTWEIGHT_CHANNEL_NAMES, _EMOTION_PROMPT_PATTERNS 모두 제거.
+//   brevity 강제 라인은 SSoT(persona.md·user-profile.md·personas.json·format-core)에서 직접 제거 완료.
+
+export function buildUserContextSection({ activeUserProfile, ownerName, ownerTitle, githubUsername, profileCache, channelName, emotionalTurn = false }) {
+  if (!activeUserProfile) {
+    // Guest
+    return [
+      '--- 게스트 접근 ---',
+      '미등록 사용자입니다. 일반 대화만 가능하며 개인 정보, 메모리, 도구 실행 등의 기능은 제공하지 않습니다.',
+    ];
+  }
+  if (activeUserProfile.type === 'owner' || activeUserProfile.role === 'owner') {
+    // [2026-05-28] 감정 턴엔 이력서/경력 정보 SKIP — 위로 응답엔 노이즈
+    //   사고 사례: 감정 발화에 "Knox Meeting"·"기술 스택"·"공백기" 정보가 주입돼
+    //   LLM이 분석가 톤으로 끌려감. Gemini Pro 대비 위로 톤 실패.
+    if (emotionalTurn) {
+      return [
+        '--- Owner Context (감정 턴 — 축약) ---',
+        `지금 대화 중인 사람은 주인님(${ownerName})이다. 위로 응답 모드 — 이력서·면접 전략 정보는 사용 금지.`,
+      ];
+    }
+    // [2026-05-21] 채널 타입별 profile 슬라이싱 — 3단계:
+    //   1. INTERVIEW_CHANNEL_PATTERN 매칭(jarvis-interview/mock 등): full profile (면접 라우팅 + STAR 16)
+    //   2. 일반/상담/분석/일상 채널(jarvis-career·jarvis·ceo·market·boram·preply 등):
+    //      면접 라우팅 룰(L3-12) strip + STAR 섹션 strip → core profile만 (기본 정보 ~ 5년 목표)
+    //   3. 게스트/비-owner: 별도 경로
+    //
+    // 사고: jarvis-career(감정 상담)에 면접 라우팅 룰 + STAR 디테일 36KB 주입돼
+    //      모델이 면접 모드로 인식 → 짧고 정형화된 답 (무료 Gemini보다 얕음).
+    let effectiveProfile = profileCache;
+    if (profileCache && channelName) {
+      const isInterviewMode = INTERVIEW_CHANNEL_PATTERN.test(channelName);
+      // STAR 섹션 strip (interview 모드가 아니면 항상)
+      if (!isInterviewMode) {
+        const starMarker = '\n## 핵심 STAR 경험';
+        const starIdx = profileCache.indexOf(starMarker);
+        // [2026-07-08] STAR 전체(≈14K토큰)는 예산상 상담 채널에 불가 → 각 STAR의 desc= 한줄요약만
+        //   추출(≈560토큰)해 "핵심 경력 요약"으로 복원. 상담 채널이 "일반론" 대신 실제 경험을 인지.
+        //   창작 0(기존 user-profile.md SSoT의 desc= 기계 추출). owner-context 섹션에 통합돼 score 8 보호 상속.
+        let starDescSummary = '';
+        if (starIdx > 0) {
+          const starBody = profileCache.slice(starIdx);
+          const descs = [...starBody.matchAll(/desc=([^|]*?)(?:\s*-->)?$/gm)]
+            .map(m => m[1].trim()).filter(Boolean);
+          if (descs.length) {
+            starDescSummary = '\n\n## 핵심 경력 요약 (STAR 압축 — 상세는 필요 시 질문)\n'
+              + descs.map(d => `- ${d}`).join('\n');
+          }
+          effectiveProfile = profileCache.slice(0, starIdx).trimEnd();
+        }
+        // 면접 답변 라우팅 룰 strip — '🚨 면접 답변 강제 라우팅' 섹션부터 '## 기본 정보' 직전까지 제거
+        const routingStartMarker = '## 🚨 면접 답변 강제 라우팅';
+        const routingEndMarker = '## 기본 정보';
+        const routingStart = effectiveProfile.indexOf(routingStartMarker);
+        const routingEnd = effectiveProfile.indexOf(routingEndMarker);
+        if (routingStart >= 0 && routingEnd > routingStart) {
+          effectiveProfile = effectiveProfile.slice(0, routingStart) + effectiveProfile.slice(routingEnd);
+        }
+        // STAR 요약을 마지막에 append (면접 라우팅 strip 후 — 순서 안전)
+        effectiveProfile += starDescSummary;
+      }
+      // isInterviewMode === true 면 full profile 그대로 (면접 라우팅 + STAR 보존)
+    }
+    // [2026-05-22 v8] lightweight 모드 폐기 — brevity 라인은 user-profile.md SSoT에서 직접 제거 완료.
+    // [2026-07-08] 헤더+안내문+프로필을 단일 원소로 결합 — 프로필 본문(effectiveProfile)이
+    //   '--- Owner Context ---' 헤더와 분리된 독립 배열 원소라 enforceBudget의 inferSectionName이
+    //   못 잡아 unnamed(score 5)로 강등 → 예산 초과 시 최우선 drop되던 근본 결함 수리.
+    //   단일 원소로 결합하면 첫 줄 헤더가 잡혀 owner-context(score 8)로 승격, 상담 채널서 프로필 보호.
+    return [
+      [
+        '--- Owner Context ---',
+        `지금 대화 중인 사람은 ${ownerName}(${ownerTitle}님, GitHub: ${githubUsername})이다. 오너가 "나 누구야?" 등으로 물으면 프로필 기반으로 답한다.`,
+        effectiveProfile,
+      ].filter(Boolean).join('\n\n'),
+    ];
+  }
+  return [
+    '--- 사용자 컨텍스트 ---',
+    `지금 대화 중인 사람은 ${activeUserProfile.name}(${activeUserProfile.title})이다. ${activeUserProfile.bio || ''}`.trim(),
+    activeUserProfile.persona ? `응답 가이드: ${activeUserProfile.persona}` : '',
+  ].filter(Boolean);
+}
+
+/**
+ * 현재 채널이 career 타입인지 반환.
+ * claude-runner.js에서 visualization 등 조건부 주입 판단에 사용.
+ */
+export function isCareerChannel(channelName) {
+  return channelName ? CAREER_CHANNEL_PATTERN.test(channelName) : false;
+}
+
+/**
+ * 현재 채널이 visual 타입인지 반환.
+ * claude-runner.js에서 visualization section 조건부 주입에 사용.
+ */
+export function isVisualChannel(channelName) {
+  return channelName ? VISUAL_CHANNEL_PATTERN.test(channelName) : false;
+}
+
+// ── Dynamic sections (added AFTER hash — don't affect session continuity) ───────
+
+/**
+ * Builds the owner persona / communication-style section (Stable).
+ * Reads context/owner/persona.md — response style, anti-bias, clarification,
+ * self-learning, and root-cause principles.
+ * Injected alongside preferences so all behavioural rules survive session resets.
+ */
+export function buildOwnerPersonaSection({ botHome, emotionalTurn = false }) {
+  // [2026-05-28] 감정 턴엔 완전히 다른 페르소나(친구 모드) 사용
+  //   기존: 집사형(주인님 호칭+존댓말) 페르소나에서 분석 가드만 strip → 여전히 분석가 톤
+  //   변경: persona-discord-emotional.md (친구 모드 SSoT) 통째로 교체
+  //   사유: Gemini Pro 비교 결과(2026-05-28) 자비스 응답이 분석가 톤으로 위로 실패.
+  //         존댓말+호칭 강제가 친구 톤 원천 차단. 페르소나 자체를 바꿔야 해결.
+  if (emotionalTurn) {
+    const emotionalPath = join(botHome, 'context', 'owner', 'persona-discord-emotional.md');
+    if (existsSync(emotionalPath)) {
+      try {
+        const content = readFileSync(emotionalPath, 'utf-8');
+        if (content.trim()) {
+          return `--- Owner Persona & Behaviour Rules (감정 턴 — 친구 모드) ---\n${content.trim()}`;
+        }
+      } catch (e) {
+        console.error(`[persona] emotional 로드 실패 — fallback to slim. ${e.message}`);
+      }
+    }
+  }
+  // [2026-05-22 v9 R4] persona-discord.md 슬림 버전 우선 로드 (~0.5KB).
+  //   원본 persona.md (~3KB)는 CLI 전체 로드용 SSoT, 디스코드 봇은 슬림 사용.
+  //   slim 파일 없으면 원본 fallback (안전망).
+  const slimPath = join(botHome, 'context', 'owner', 'persona-discord.md');
+  const fullPath = join(botHome, 'context', 'owner', 'persona.md');
+  const personaPath = existsSync(slimPath) ? slimPath : fullPath;
+  try {
+    const content = readFileSync(personaPath, 'utf-8');
+    if (!content.trim()) {
+      console.error(`[persona] WARN: ${personaPath} 비어있음 — 페르소나 가드 미주입`);
+      return '';
+    }
+    let effective = content.trim();
+    // [2026-06-22] 깊이 가드("## 질문 길이 ≠ 응답 깊이" ~ "## 모델 깊이 가드")를 항상 분리.
+    //   별도 buildDepthGuardSection이 score 9로 독립 push → budget 절단 시 persona 본체(score 7)와
+    //   통째로 잘리지 않음. (이전: 감정 턴에만 제거 → 비감정 분석 질문에서 persona-rules가 budget 절단으로
+    //   통째 drop 시 깊이 가드 5개가 snapshot에 0회 반영되던 구조 결함. 설계: autoplan 2026-06-22)
+    const analysisStart = effective.indexOf('\n## 질문 길이');
+    const analysisEnd = effective.indexOf('\n## 인지 원칙');
+    if (analysisStart >= 0 && analysisEnd > analysisStart) {
+      effective = effective.slice(0, analysisStart) + effective.slice(analysisEnd);
+    }
+    // 분석 채널 매트릭스 섹션도 제거 (운영 메타 정보 — 봇 응답에 불필요)
+    const matrixStart = effective.indexOf('\n## 분석 채널 매트릭스');
+    if (matrixStart >= 0) {
+      effective = effective.slice(0, matrixStart);
+    }
+    return `--- Owner Persona & Behaviour Rules (항상 준수) ---\n${effective}`;
+  } catch (e) {
+    console.error(`[persona] FATAL: ${personaPath} 로드 실패 — ${e.message}. 페르소나 가드 없이 응답 생성됨.`);
+    return '';
+  }
+}
+
+/**
+ * [2026-06-22] 깊이 가드 전용 섹션 — persona-rules에서 분리해 score 9로 독립 push.
+ *   분석채널 budget 절단(원본 median 28K vs 예산 12K) 시 persona 통째 drop으로
+ *   깊이 가드 5개(양날의검·이해관계·역설·메타동기·무기화)가 snapshot에 0회 반영되던 구조 결함 수리.
+ *   persona-discord.md "## 질문 길이 ≠ 응답 깊이" ~ "## 모델 깊이 가드" 추출. 감정 턴 제외(감정 가드 주도).
+ *   헤더 "응답 깊이 가드" → inferSectionName이 'depth-guard'(score 9, prompt-harness.js) 추론.
+ */
+export function buildDepthGuardSection({ botHome, channelId }) {
+  // [2026-07-20] 채널별 응답 길이 차등: 일상/가족/튜터 채널은 무거운 깊이 가드(1,000자+·9항목)
+  //   대신 "모바일 간결 기본 + 깊이 on-demand" 가드를 주입한다. 헤더 토큰 "응답 깊이 가드"를
+  //   유지해 inferSectionName이 depth-guard(score 9)로 인식 → budget 절단에서 동일하게 보호됨.
+  //   분석 채널(career/dev/ceo/market)·기타 운영 채널은 아래 무거운 깊이 가드를 현행 유지.
+  if (channelId && DAILY_CONCISE_CHANNEL_IDS.has(channelId)) {
+    return [
+      '--- 응답 깊이 가드 (일상·가족·튜터 채널 — 모바일 간결 기본 · 항상 준수) ---',
+      '주인님·가족이 디스코드 모바일 앱으로 읽습니다. 한 응답이 900자를 넘는 벽글은 UX를 해쳐 앱 이탈을 부릅니다. 이 채널의 기본값은 모바일 간결입니다.',
+      '- 결론을 첫 줄에. 단순 확인·잡담·정보 조회는 1~3줄, 일반 대화는 3~8줄을 기준으로 한다.',
+      '- 단, 설명·비교·결정·투자·건강·교육·여행계획처럼 깊이가 필요한 질문은 충분히 답하되 — 결론부터, 불릿(-)으로 쪼개, 장황한 서론·중복·미사여구 없이. 깊이는 길이가 아니라 구체성·개인화에서 온다.',
+      "- '이거 어때?' 류엔 결론 + 이유 + 장단점 + 더 나은 대안을 압축해 담는다. 내용 없는 되묻기·'좋아요' 한 줄·무료 AI식 일반론 금지 (빈약 ≠ 간결).",
+      "- 사용자가 '자세히/더/왜/깊게'를 요청하면 그때 확장한다.",
+      '- 감정 발화는 이 길이 규칙과 무관 — 공감 가드가 주도한다(짧더라도 따뜻하게).',
+      '- 마크다운 헤딩(##/###)·테이블(| |) 금지. 불릿(-)·이모지는 유지.',
+    ].join('\n');
+  }
+  const personaPath = join(botHome, 'context', 'owner', 'persona-discord.md');
+  try {
+    if (!existsSync(personaPath)) return '';
+    const content = readFileSync(personaPath, 'utf-8');
+    const start = content.indexOf('## 질문 길이');
+    const end = content.indexOf('\n## 인지 원칙');
+    if (start < 0 || end <= start) return '';
+    const guard = content.slice(start, end).trim();
+    if (!guard) return '';
+    return `--- 응답 깊이 가드 (분석·예측·조언 — 항상 준수) ---\n${guard}`;
+  } catch (e) {
+    console.error(`[depth-guard] persona-discord.md 로드 실패 — ${e.message}`);
+    return '';
+  }
+}
+
+/**
+ * Builds the owner system preferences section (Stable).
+ * Reads context/owner/preferences.md — tool/service constraints that must
+ * survive session resets (e.g. "Use Calendar X ONLY, Y forbidden").
+ * Called per-session; caller handles 5-minute caching via _ownerPrefsCache.
+ */
+export function buildOwnerPreferencesSection({ botHome }) {
+  try {
+    const content = readFileSync(join(botHome, 'context', 'owner', 'preferences.md'), 'utf-8');
+    if (!content.trim()) return '';
+    return `--- Owner System Preferences (항상 준수) ---\n${content.trim()}`;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Builds the owner visualization policy section (Stable).
+ * Reads context/owner/visualization.md — AI Slop prevention + design defaults
+ * applied to all visual outputs (Discord cards, jarvis-board, resume, blog, HTML reports).
+ * 출처: Anthropic Opus 4.7 프롬프팅 가이드 (2025-04).
+ */
+export function buildOwnerVisualizationSection({ botHome }) {
+  try {
+    const content = readFileSync(join(botHome, 'context', 'owner', 'visualization.md'), 'utf-8');
+    if (!content.trim()) return '';
+    return `--- Visual Output Design Policy (시각 결과물에 항상 적용) ---\n${content.trim()}`;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Builds family channel briefing context (Dynamic — AFTER hash).
+ * Reads state/family-last-briefing.json and injects today's briefing data
+ * so the bot never hallucinates lesson counts or amounts after webhook delivery.
+ * Returns empty string if no briefing exists or if it's not from today.
+ */
+export function buildFamilyBriefingContext({ botHome }) {
+  const NO_DATA_WARNING =
+    '⚠️ 오늘 수업 데이터 미수신 — 수업 건수·금액 절대 추측 금지. "오늘 스케줄 데이터를 가져오지 못했어요. 잠시 후 다시 물어봐 주세요." 라고만 답할 것.';
+  try {
+    const cachePath = join(botHome, 'state', 'family-last-briefing.json');
+    const raw = readFileSync(cachePath, 'utf-8');
+    const cache = JSON.parse(raw);
+
+    // KST 오늘 날짜
+    const today = new Date(Date.now() + 9 * 3600_000).toISOString().slice(0, 10);
+    if (cache.date !== today) return NO_DATA_WARNING;
+
+    // 파싱 실패 혹은 수업이 0건이고 message에 실패 표시가 있으면 경고 반환
+    if (cache.lessonCount === 0 && cache.message && /실패|error/i.test(cache.message)) {
+      return NO_DATA_WARNING;
+    }
+
+    const lessonLines = (cache.lessons || [])
+      .map(l => `  - ${l.time} ${l.student} $${l.amount}`)
+      .join('\n');
+
+    return [
+      `--- 오늘 아침 브리핑 (이미 로드됨) ---`,
+      `오늘(${cache.date}) 수업: ${cache.lessonCount}건 / 총 $${cache.totalUsd}`,
+      lessonLines,
+      `⚠️ 수업 건수·금액 언급 시 반드시 위 데이터 기준으로 답할 것. 추측 금지.`,
+    ].filter(Boolean).join('\n');
+  } catch {
+    return NO_DATA_WARNING;
+  }
+}
+
+// ── LLM Wiki 컨텍스트 주입 (Dynamic section) ────────────────────────────────
+
+const WIKI_DOMAIN_RULES = [
+  { domain: 'trading',   re: /stock|주식|트레이딩|레버리지|etf|매수|매도|포트폴리오|s&p|nasdaq|tqqq|수익률|시장/i },
+  { domain: 'career',    re: /이직|면접|연봉|이력서|채용|핀테크|spring|kafka|grpc|redis|star/i },
+  { domain: 'ops',       re: /크론|cron|디스크|봇.*상태|장애|서킷|에러|rag|모니터링|watchdog|배포|deploy/i },
+  { domain: 'knowledge', re: /아키텍처|디자인.*패턴|기술.*트렌드|오픈소스|github|블로그|학습|wiki/i },
+  { domain: 'health',    re: /건강|운동|병원|몸무게|다이어트|수면|자전거|사이클/i },
+  { domain: 'family',    re: /아내|와이프|가족|부모님|아이|육아|수업|레슨/i },
+];
+
+function _detectWikiDomain(prompt) {
+  for (const { domain, re } of WIKI_DOMAIN_RULES) {
+    if (re.test(prompt)) return domain;
+  }
+  return null;
+}
+
+/**
+ * LLM Wiki 컨텍스트 빌더.
+ * 프롬프트에서 도메인 감지 → 해당 _summary.md + 관련 페이지 로드 → 최대 2,000자.
+ * Dynamic section으로 주입 — 세션 해시에 영향 없음.
+ *
+ * [2026-05-22 v7] wiki 발췌 시 brevity 메타 룰 자동 strip — 면접 톤 가이드 같은
+ *   메타 라인이 디스코드 응답 길이를 압축하는 부작용 차단 (재발 가드).
+ */
+const _WIKI_BREVITY_META_PATTERNS = [
+  /^[>\-\s]*답변\s*톤\s*[:：][^\n]*$/gm,
+  /^[>\-\s]*\d+\s*~\s*\d+\s*문장이?\s*기본[^\n]*$/gm,
+  /^[>\-\s]*간결\s*[·,]\s*자신감[^\n]*$/gm,
+  /^[>\-\s]*짧게\s*답변[^\n]*$/gm,
+  /^[>\-\s]*1\s*~\s*\d+\s*줄로\s*[^\n]*$/gm,
+  /^[>\-\s]*TL\s*;\s*DR[^\n]*$/gm,
+];
+function _stripWikiBrevityMeta(text) {
+  if (!text) return text;
+  let out = text;
+  for (const rx of _WIKI_BREVITY_META_PATTERNS) {
+    out = out.replace(rx, '');
+  }
+  out = out.replace(/\n{3,}/g, '\n\n');
+  return out;
+}
+
+export function buildWikiContextSection({ prompt, botHome, userId }) {
+  if (!prompt) return '';
+  const wikiDir = join(botHome, 'wiki');
+  if (!existsSync(wikiDir)) return '';
+
+  // [2026-05-22 v8] lightweight 모드 폐기 — 모든 채널 동일 캡 (이전 lightweight 값 채택).
+  //   진단: 25KB 시스템 프롬프트가 모델 사고 공간 압박 → 작은 prompt + 단일 모드로 통일.
+  const CAP_SUMMARY = 600;
+  const CAP_FILE = 250;
+  const CAP_FACTS = 250;
+  const CAP_MISTAKES_TOPN = 5;
+  const CAP_MISTAKES_CHARS = 1500;
+  const CAP_TOTAL = 2800;
+
+  const parts = [];
+
+  // 1. 도메인 기반 전역 위키 (career/_summary.md 등)
+  const domain = _detectWikiDomain(prompt);
+  if (domain) {
+    const domainDir = join(wikiDir, domain);
+    if (existsSync(domainDir)) {
+      const summaryPath = join(domainDir, '_summary.md');
+      if (existsSync(summaryPath)) {
+        let summary = readFileSync(summaryPath, 'utf-8');
+        summary = summary.replace(/^```ya?ml\n---[\s\S]*?---\n```\n*/m, '');
+        summary = summary.replace(/^---[\s\S]*?---\n*/m, '');
+        summary = _stripWikiBrevityMeta(summary);
+        parts.push(`### [${domain}]\n${summary.trim().slice(0, CAP_SUMMARY)}`);
+      }
+      try {
+        const files = readdirSync(domainDir)
+          .filter(f => f.endsWith('.md') && f !== '_summary.md')
+          .slice(0, 2);
+        for (const file of files) {
+          let content = readFileSync(join(domainDir, file), 'utf-8');
+          content = content.replace(/^```ya?ml\n---[\s\S]*?---\n```\n*/m, '');
+          content = content.replace(/^---[\s\S]*?---\n*/m, '');
+          content = _stripWikiBrevityMeta(content);
+          if (content.trim().length > 50) {
+            parts.push(content.trim().slice(0, CAP_FILE));
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // 2. _facts.md (실시간 기록) — _summary.md가 없는 도메인 폴백
+  if (domain) {
+    const factsPath = join(wikiDir, domain, '_facts.md');
+    if (existsSync(factsPath) && !existsSync(join(wikiDir, domain, '_summary.md'))) {
+      const facts = _stripWikiBrevityMeta(readFileSync(factsPath, 'utf-8'));
+      if (facts.trim().length > 50) {
+        parts.push(`### [${domain}/실시간]\n${facts.trim().slice(0, CAP_FACTS)}`);
+      }
+    }
+  }
+
+  // 3. meta/learned-mistakes.md — 도메인 불문 항상 주입 (Compound Engineering)
+  //    오답노트는 "실수 회피"용이므로 모든 응답 전에 참조되어야 함.
+  //    도메인 감지와 무관하게 전역 주입.
+  //    [가드 #3 2026-04-28] top5 → top10, 캡 1800 → 2500, 키워드 매칭 우선 정렬.
+  //    이유: 최신 5건만 노출하면 관련 항목이 6위 이하일 때 LLM에게 안 보임.
+  //    사용자 prompt 토큰(2자+ 한글, 3자+ 영문) 추출 → 헤더 섹션별 매칭 점수 부여 → 정렬.
+  //    최신성 보너스(상위 3건 +10) 유지로 시간/관련성 균형.
+  let mistakesInjected = false;
+  try {
+    const mistakesPath = join(wikiDir, 'meta', 'learned-mistakes.md');
+    if (existsSync(mistakesPath)) {
+      let mistakes = readFileSync(mistakesPath, 'utf-8');
+      mistakes = mistakes.replace(/^---[\s\S]*?---\n*/m, '').trim();
+      if (mistakes.length > 100) {
+        const sections = mistakes.split(/^(?=## \d{4}-\d{2}-\d{2})/m);
+        const headerSections = sections.filter(s => /^## \d{4}-\d{2}-\d{2}/.test(s));
+
+        // 가드 #3: 사용자 prompt 키워드 추출
+        const promptTokens = (prompt || '')
+          .toLowerCase()
+          .match(/[가-힣]{2,}|[a-z]{3,}/g) || [];
+        const uniqTokens = [...new Set(promptTokens)].slice(0, 20);
+
+        // 섹션별 매칭 점수 (긴 토큰 가중)
+        const scored = headerSections.map((sec, idx) => {
+          const lower = sec.toLowerCase();
+          let score = 0;
+          for (const tok of uniqTokens) {
+            if (lower.includes(tok)) score += tok.length;
+          }
+          if (idx < 3) score += 10; // 최신 보너스
+          return { sec, idx, score };
+        });
+        scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
+        const topN = scored.slice(0, CAP_MISTAKES_TOPN).map(x => x.sec.trim());
+
+        const safe = topN.join('\n\n') || mistakes.slice(0, CAP_MISTAKES_CHARS - 300);
+        const capped = safe.length > CAP_MISTAKES_CHARS ? safe.slice(0, CAP_MISTAKES_CHARS) + '\n[...더 있음]' : safe;
+        parts.push(`### [meta/오답노트]\n${capped}`);
+        mistakesInjected = true;
+      }
+    }
+  } catch {}
+
+  if (parts.length === 0) return '';
+
+  let result = `--- 위키 컨텍스트 ---\n${parts.join('\n\n')}`;
+  // [2026-05-22 v7c] lightweight 모드는 CAP_TOTAL=2800, 기본은 4500.
+  if (result.length > CAP_TOTAL) {
+    result = result.slice(0, CAP_TOTAL) + '\n[...더 있음]';
+  }
+
+  // 위키 주입 관찰 로그 — 실제로 주입되는지 추적
+  // mistakes 필드 추가: meta/learned-mistakes.md 주입 여부 별도 기록 (reference-report용)
+  try {
+    const logLine = JSON.stringify({
+      ts: new Date().toISOString(),
+      domain: domain || 'none',
+      chars: result.length,
+      parts: parts.length,
+      mistakes: mistakesInjected,
+    }) + '\n';
+    appendFileSync(join(botHome, 'logs', 'wiki-inject.log'), logLine);
+  } catch {}
+
+  return result;
+}
+
+// ── 분노 신호 강제 주입 섹션 (Harness P2) ──────────────────────────────
+// anger-detector가 24h 이내 감지한 최신 분노 신호 1건을 다음 turn system prompt에
+// "🚨 직전 정정" 헤더로 강제 주입. 같은 편향 즉시 재발 차단.
+// learned-mistakes.md top5 캡 밖이라도, 사용자가 방금 정정한 신호는 무조건 LLM에 노출.
+export function buildAngerCorrectionSection({ botHome }) {
+  try {
+    const signalsFile = join(botHome, 'state', 'anger-signals.jsonl');
+    if (!existsSync(signalsFile)) return '';
+    const raw = readFileSync(signalsFile, 'utf-8').trim();
+    if (!raw) return '';
+    const lines = raw.split('\n').filter(Boolean);
+    if (lines.length === 0) return '';
+    let last;
+    try { last = JSON.parse(lines[lines.length - 1]); } catch { return ''; }
+    if (!last || !last.ts) return '';
+    // 24h retention
+    const lastMs = new Date(last.ts.replace('+09:00', 'Z')).getTime() - 9 * 3600_000;
+    const ageH = (Date.now() - lastMs) / 3600_000;
+    if (ageH > 24) return '';
+    return `🚨 직전 정정 신호 (${last.ts.slice(11, 16)} KST · 키워드: "${last.keyword}")
+주인님이 방금 직전 응답을 정정하셨습니다. 같은 편향 절대 재발 금지.
+
+[직전 사용자 발화]: ${(last.userText || '').slice(0, 300)}
+[직전 자비스 응답 일부]: ${(last.assistantText || '').slice(0, 400)}
+
+이번 응답은 위 정정을 반영하여 작성하십시오. 동일 패턴 반복 시 즉시 신뢰 붕괴.`;
+  } catch {
+    return '';
+  }
+}
+
+// ── 가드 #2 (2026-04-28): 자동 하네스 트리거 섹션 ───────────────────────
+// 사용자 발화에 "동작 원리/메커니즘/어떻게 답 결정" 류 키워드 매칭 시
+// 관련 하네스 스크립트 자동 실행 → 결과를 system prompt에 강제 주입.
+// LLM이 페르소나 자연어 룰만 보고 코드 SSoT 누락하는 거짓 답변 차단.
+export async function buildHarnessAutoTriggerSection(prompt) {
+  if (!prompt || typeof prompt !== 'string') return '';
+  try {
+    const { autoTriggerHarness } = await import('./skill-auto-trigger.mjs');
+    const injected = await autoTriggerHarness(prompt);
+    return injected || '';
+  } catch (err) {
+    return '';
+  }
+}
+
+// ── 가드 #5 (2026-04-29): _facts.md 키워드 매칭 자동 발췌 ───────────────────
+// 직전 SSoT Cross-Link 봉쇄 사고: career/_summary.md 존재로 _facts.md 4000줄
+// (interview-deep-* 풀 디테일 3995건)이 시스템 프롬프트에 영구 미주입.
+// 해결: 사용자 프롬프트 키워드와 매칭되는 bullet line top-N을 600~1000자로 발췌 주입.
+//
+// 동작:
+//  1. 도메인 감지 (이미 _detectWikiDomain 재사용)
+//  2. {domain}/_facts.md 라인 단위 분리
+//  3. 사용자 prompt 토큰 추출 (한글 2자+ / 영문 3자+)
+//  4. 라인별 매칭 점수 (긴 토큰 가중)
+//  5. top 8 라인 + 800자 캡으로 발췌
+//  6. 매칭 0건이면 빈 문자열 (noise 차단)
+//
+// 효과:
+//  - 4000줄짜리 _facts.md 풀 인덱스에서 관련 부분만 자동 인출
+//  - LLM "PENDING/추정" 단정 전 진짜 팩트 도달
+//
+// [보강 2026-04-29] LRU 캐시 (5분 TTL, max 16) — skill-auto-trigger 패턴 동일.
+//   동일 (prompt+domain+factsMtime) 키 5분 내 재호출 시 grep 스킵 → 5~10ms 절감.
+//   _facts.md 변경 시 mtime 키로 자동 무효화.
+const FACTS_KW_CACHE = new Map();
+const FACTS_KW_CACHE_TTL_MS = 5 * 60 * 1000;
+const FACTS_KW_CACHE_MAX = 16;
+
+function _factsKwCacheGet(key) {
+  const e = FACTS_KW_CACHE.get(key);
+  if (!e) return null;
+  if (Date.now() > e.expiresAt) { FACTS_KW_CACHE.delete(key); return null; }
+  return e.result;
+}
+function _factsKwCacheSet(key, result) {
+  if (FACTS_KW_CACHE.size >= FACTS_KW_CACHE_MAX) {
+    const oldest = FACTS_KW_CACHE.keys().next().value;
+    if (oldest) FACTS_KW_CACHE.delete(oldest);
+  }
+  FACTS_KW_CACHE.set(key, { result, expiresAt: Date.now() + FACTS_KW_CACHE_TTL_MS });
+}
+
+// ── 가드 #9 (2026-04-29) — 실측 의무 트리거 (Evidence Mandate) ────────────────
+// 사용자 prompt가 인프라/시스템 검토 카테고리면 시스템 프롬프트에 실측 의무 룰 강제 prepend.
+// LLM 의식 의존 차단 — "딥다이브·검토·분석" 키워드 매칭 시 실측 증거 첨부 의무화.
+//
+// 트리거 키워드 (정밀 매칭):
+//   - 검토·분석·딥다이브·실측·점검·검증
+//   - 왜·이유·원인·문제·결함·이슈
+//   - 메카니즘·동작·원리·구조·흐름·아키텍처
+//   - 박힘·주입·노출·매칭·발동·적용
+//
+// 효과: 가드 #10 (단정 표현 검출)과 함께 동작 — prepend된 룰을 LLM이 보면
+// 단정 표현 자체를 줄임 + 단정 시 실측 증거 동반 → 가드 #10 false positive ↓.
+const EVIDENCE_MANDATE_KEYWORDS = [
+  /딥다이브|deepdive/i,
+  /검토|점검|검증|verify/i,
+  /분석|analysis/i,
+  /실측|측정/,
+  /왜\s*(?:이렇|그렇|안|못|틀|거짓)/,
+  /(?:이유|원인|문제|결함|이슈|bug|버그)\s*(?:가|를|는|이|의)?/,
+  /(?:메카니즘|메커니즘|동작\s*원리|구조|흐름|아키텍처)/,
+  /(?:박힘|주입|노출|매칭|발동|적용|호출|실행)\s*(?:되|중|확인|검증)/,
+  /(?:맞을지|맞는지|틀린지|거짓|단정)/,
+];
+
+export function buildEvidenceMandateSection({ prompt }) {
+  if (!prompt || typeof prompt !== 'string') return '';
+  const matched = EVIDENCE_MANDATE_KEYWORDS.some(rx => rx.test(prompt));
+  if (!matched) return '';
+
+  return `🚨 실측 의무 트리거 (가드 #9) — 본 질문은 인프라/시스템 검토 카테고리입니다.
+
+답변 작성 규칙 (위반 시 거짓 단정 위험 — 가드 #10이 차단합니다):
+
+1. **단정 표현 옆에 실측 증거 직접 인용 필수**
+   - 코드 라인 번호 (예: \`prompt-sections.js#L277\`)
+   - 로그 출력 raw 인용 (\`\`\`...\`\`\`로 감싸기)
+   - grep/awk/Bash 명령 출력
+   - 파일 mtime·크기 등 stat 결과
+
+2. **증거 없는 단정 절대 금지** — "추정"·"가능성"·"~로 보임" 표현으로 대체
+
+3. **다음 표현은 실측 증거 없이 사용 시 가드 #10이 응답 차단**:
+   - "박힘 0건 · 주입 0건 · 노출 0 · 매칭 0건"
+   - "정확 동일 · 완전 동일 · 정확히 일치"
+   - "이미 박혀있음 · 이미 적용됨 · 이미 작동중"
+   - "확정됨 · 미주입 · 미적용 · 전혀 없"
+
+4. **코드 grep만으로 단정 금지** — 다음 3가지를 동시 실측:
+   - 코드 (grep·Read)
+   - 로그 출력 (봇 stdout/stderr·cron log)
+   - 실행 흔적 (프로세스 env·실제 동작 결과)
+
+5. **위반 시 다음 turn에 강제 정정 신호 prepend** — anger-signals.jsonl 자동 기록.
+
+오답노트 패턴 (이번 세션 6건 거짓 단정 학습):
+- 코드 grep만으로 시스템 구조 단정 (실측 회피)
+- dotenv 추가 로드·SSoT 분기 빌더 누락
+- 봇 출력 로그 미확인 → "활성 X" 단정
+- env 의존성 미검증 → "박힘 0건" 단정`;
+}
+
+// ── 가드 #5 (2026-04-29) — _facts.md 키워드 grep ────────────────────────────
+export function buildFactsKeywordSection({ prompt, botHome }) {
+  if (!prompt || typeof prompt !== 'string') return '';
+  try {
+    const domain = _detectWikiDomain(prompt);
+    if (!domain) return '';
+
+    const factsPath = join(botHome, 'wiki', domain, '_facts.md');
+    if (!existsSync(factsPath)) return '';
+
+    // LRU 캐시 hit 검사 — prompt 첫 200자 + domain + mtime
+    let cacheKey = '';
+    try {
+      const mtime = statSync(factsPath).mtimeMs | 0;
+      cacheKey = `${domain}:${mtime}:${prompt.slice(0, 200)}`;
+      const cached = _factsKwCacheGet(cacheKey);
+      if (cached !== null) return cached;
+    } catch { /* 캐시 실패해도 계속 진행 */ }
+
+    const facts = readFileSync(factsPath, 'utf-8');
+    if (!facts || facts.length < 100) return '';
+
+    // 사용자 prompt 토큰 추출 (한글 2자+ / 영문 3자+)
+    const promptTokens = (prompt || '')
+      .toLowerCase()
+      .match(/[가-힣]{2,}|[a-z]{3,}/g) || [];
+    const uniqTokens = [...new Set(promptTokens)].slice(0, 25);
+    if (uniqTokens.length === 0) return '';
+
+    // bullet line만 추출 (- [YYYY-MM-DD] [source:...] 패턴)
+    const lines = facts.split('\n')
+      .filter(line => /^- \[\d{4}-\d{2}-\d{2}\]/.test(line));
+    if (lines.length === 0) return '';
+
+    // 라인별 매칭 점수 (긴 토큰 가중치 ↑)
+    const scored = lines.map((line) => {
+      const lower = line.toLowerCase();
+      let score = 0;
+      for (const tok of uniqTokens) {
+        if (lower.includes(tok)) {
+          score += tok.length;  // 긴 토큰일수록 의미 있음
+        }
+      }
+      return { line, score };
+    }).filter(s => s.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    if (scored.length === 0) {
+      if (cacheKey) _factsKwCacheSet(cacheKey, '');
+      return '';
+    }
+
+    // top 8 + 800자 캡
+    const TOP_N = 8;
+    const CAP = 800;
+    const picked = [];
+    let total = 0;
+    for (const { line } of scored.slice(0, TOP_N)) {
+      const trimmed = line.trim();
+      if (total + trimmed.length + 1 > CAP) break;
+      picked.push(trimmed);
+      total += trimmed.length + 1;
+    }
+    if (picked.length === 0) {
+      if (cacheKey) _factsKwCacheSet(cacheKey, '');
+      return '';
+    }
+
+    const out = [
+      `--- [${domain}/_facts 키워드 매칭 발췌 — 매 응답 자동 인출] ---`,
+      `사용자 발화 키워드(${uniqTokens.slice(0, 8).join(', ')})와 매칭되는 _facts.md 항목 ${picked.length}건. 진짜 팩트 베이스 — PENDING/추정 단정 전 반드시 참조:`,
+      '',
+      ...picked,
+      `--- _facts 발췌 끝 ---`,
+    ].join('\n');
+    if (cacheKey) _factsKwCacheSet(cacheKey, out);
+    return out;
+  } catch {
+    return '';
+  }
+}
+
+// ── 튜터링 플랫폼 쿼리 판별 (pre-processor, handlers 공용) ──────────────────
+const TUTORING_PATTERN = /수입|매출|레슨\s*금액|얼마|정산|취소\s*보상|오늘\s*얼마|오늘\s*수업|내일\s*수업|이번\s*주\s*수업|수업\s*일정|수업\s*몇|레슨|오늘\s*일정|내일\s*일정|이번\s*주\s*일정/i;
+
+export function isTutoringQuery(prompt) {
+  return TUTORING_PATTERN.test(prompt ?? '');
+}
+
+// ── 오너 시간 인식 컨텍스트 (Dynamic section) ────────────────────────────────
+// KST 현재시각 + 마지막 활동 경과시간 + 오너 수면 패턴을 주입.
+// runtime/state/last-activity.json, owner-schedule.json 파일 기반.
+// 파일 없어도 봇 크래시 없도록 try-catch 전체 감싸기.
+export function buildOwnerTimeContext({ botHome }) {
+  if (!botHome) return '';
+
+  const stateDir = join(botHome, 'state');
+  const lines = [];
+
+  // 1. KST 현재시각
+  try {
+    const now = new Date();
+    const parts = new Intl.DateTimeFormat('ko-KR', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', weekday: 'short',
+      hour12: false,
+    }).formatToParts(now);
+    const get = (type) => parts.find(p => p.type === type)?.value ?? '';
+    const kstStr = `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')} KST (${get('weekday')})`;
+    lines.push(`현재 KST: ${kstStr}`);
+
+    // 내일 날짜 명시 주입 — LLM이 "내일"을 잘못 계산하는 오류 방지
+    const tomorrow = new Date(now.getTime() + 24 * 3600_000);
+    const tParts = new Intl.DateTimeFormat('ko-KR', {
+      timeZone: 'Asia/Seoul',
+      year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'short',
+    }).formatToParts(tomorrow);
+    const tGet = (type) => tParts.find(p => p.type === type)?.value ?? '';
+    lines.push(`내일: ${tGet('year')}-${tGet('month')}-${tGet('day')} (${tGet('weekday')})`);
+
+    // 날짜 혼동 방지 강제 지시 — LLM이 "내일"을 "오늘"로 말하는 오류 차단
+    lines.push(`⚠️ 날짜 규칙: 오늘은 반드시 ${get('year')}-${get('month')}-${get('day')}(${get('weekday')}). 내일(${tGet('month')}-${tGet('day')})을 오늘로 절대 혼동 금지.`);
+  } catch { /* silent */ }
+
+  // 2. 마지막 활동 경과시간
+  try {
+    const lastActivityPath = join(stateDir, 'last-activity.json');
+    if (existsSync(lastActivityPath)) {
+      const data = JSON.parse(readFileSync(lastActivityPath, 'utf-8'));
+      if (data.timestamp) {
+        const lastTs = new Date(data.timestamp).getTime();
+        const elapsedMs = Date.now() - lastTs;
+        const elapsedH = Math.floor(elapsedMs / 3600_000);
+        const elapsedM = Math.floor((elapsedMs % 3600_000) / 60_000);
+        if (elapsedH > 0) {
+          lines.push(`마지막 활동: ${elapsedH}시간 ${elapsedM}분 전`);
+        } else if (elapsedM > 1) {
+          lines.push(`마지막 활동: ${elapsedM}분 전`);
+        }
+      }
+    }
+  } catch { /* silent */ }
+
+  // 3. 오너 수면 패턴
+  try {
+    const schedulePath = join(stateDir, 'owner-schedule.json');
+    if (existsSync(schedulePath)) {
+      const schedule = JSON.parse(readFileSync(schedulePath, 'utf-8'));
+      if (schedule.wake_time) lines.push(`오너 기상 시간: ${schedule.wake_time}`);
+      if (schedule.sleep_time) lines.push(`오너 취침 시간: ${schedule.sleep_time}`);
+    }
+  } catch { /* silent */ }
+
+  if (lines.length === 0) return '';
+  return `--- 오너 시간 컨텍스트 ---\n${lines.join('\n')}`;
+}
+
+// preply 학생 프로필 + 영구 규칙 자동 주입 (2026-06-28)
+// 사고: 봇이 라라 등 이미 등록된 학생을 "프로필 기록 없음"이라 하고(보람님 "또 말하게 하냐" 불만),
+//   permanent_rules(점수금지·정답지분리·정답숨김)를 반복 위반. SKILL.md "list로 읽어라" 설득으론
+//   봇 행동이 안 바뀜 → 데이터를 컨텍스트에 직접 주입(행동 의존 제거). RAG 사전주입과 동일 원리.
+export function buildPreplyStudentSection({ messageText, botHome }) {
+  try {
+    if (!botHome) return '';
+    const regPath = join(botHome, 'config', 'preply-students.json');
+    if (!existsSync(regPath)) return '';
+    const reg = JSON.parse(readFileSync(regPath, 'utf-8'));
+    const students = reg.students || [];
+    const text = (messageText || '').toLowerCase();
+    const parts = [];
+
+    // 영구 규칙은 항상 주입 (모든 교재 작업에 BLOCKING 적용)
+    const pr = reg._meta?.permanent_rules;
+    if (pr) {
+      const rules = Object.entries(pr)
+        .filter(([k]) => !k.startsWith('_'))
+        .map(([k, v]) => `· [${k}] ${v}`)
+        .join('\n');
+      if (rules) parts.push('📌 영구 교재 규칙 (BLOCKING — 매번 적용, 보람님이 반복 지적한 항목):\n' + rules);
+    }
+
+    // 메시지에 언급된 학생 프로필 주입 ("기록 없음" 오류 차단)
+    const mentioned = students.filter((s) => {
+      const names = [s.name_ko, s.name_en, ...(s.alt_names || [])].filter(Boolean);
+      return names.some((n) => text.includes(String(n).toLowerCase()));
+    });
+    if (mentioned.length) {
+      for (const s of mentioned) {
+        parts.push(
+          `👤 학생 [${s.name_ko}/${s.name_en || ''}] 프로필 (레지스트리에 있음 — "프로필 기록 없음"이라 절대 말하지 말 것):\n` +
+          `· 나라=${s.country || '?'} / 나이=${s.age || '?'} / 레벨=${s.level || '?'} / 테마=${s.theme || '?'}\n` +
+          `· 관심사=${(s.interests || []).join('·') || '(notes 참조)'} / 목표=${s.goal || '?'} / 유닛=${s.units || '?'} / 최근유닛=${s.last_unit || '?'}\n` +
+          `· is_trial=${s.is_trial} / 숙제PDF필요=${s.needs_homework_pdf} / 자료유형=${s.material_type || 'standard'} / 최신파일=${s.latest_file || '?'}\n` +
+          `· 비고=${s.notes || ''}`
+        );
+      }
+    } else {
+      parts.push(
+        '👥 등록 학생: ' + students.map((s) => `${s.name_ko}(${s.name_en || ''})`).join(', ') +
+        '\n— 작업 대상이 누구인지 확인하고, 상세 프로필은 `preply-student.sh list`로 조회. 학생 정보를 추측하거나 "없다"고 단정 금지.'
+      );
+    }
+
+    // 쓰기 안내: 새 정보를 받으면 레지스트리에 즉시 반영 (다음에 또 묻지 않도록)
+    parts.push(
+      '✍️ 보람님이 새 학생 정보나 기존 학생의 변경 정보를 주면, 작업과 함께 ' +
+      '`bash ~/jarvis/infra/scripts/preply-student.sh upsert <학생명> \'{"country":"...","age":0,"interests":["..."]}\'` 로 ' +
+      '즉시 레지스트리에 저장하라(말로만 "저장했다" 금지 — 케이리 사고). 교재 전송(send)은 최신파일을 자동 갱신한다.'
+    );
+
+    if (!parts.length) return '';
+    return '--- 📚 preply 학생 프로필 + 영구 규칙 (레지스트리 자동 주입) ---\n' + parts.join('\n\n');
+  } catch {
+    return '';
+  }
+}
+

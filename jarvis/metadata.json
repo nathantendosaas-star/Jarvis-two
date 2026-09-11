@@ -1,0 +1,6 @@
+{
+  "name": "JARVIS AI Operating System",
+  "description": "A premium AI-native operating environment to orchestrate agents, manage projects, and automate workflows.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

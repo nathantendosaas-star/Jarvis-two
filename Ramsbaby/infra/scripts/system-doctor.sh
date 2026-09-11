@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+# system-doctor.sh — Jarvis 자동 시스템 점검 (비대화형, 매일 06:00)
+# 이상 없으면 한 줄 OK, WARN/FAIL 있으면 Discord jarvis-system 알림
+
+set -euo pipefail
+
+BOT_HOME="${BOT_HOME:-${HOME}/jarvis/runtime}"
+source "${BOT_HOME}/lib/compat.sh" 2>/dev/null || {
+  IS_MACOS=false; IS_LINUX=false
+  case "$(uname -s)" in Darwin) IS_MACOS=true ;; Linux) IS_LINUX=true ;; esac
+}
+LOG="$BOT_HOME/logs/system-doctor.log"
+ROUTE="$BOT_HOME/bin/route-result.sh"
+TIMEOUT_CMD=$(command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || echo "")
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:${PATH}"
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+# ── 결과 저장소 (임시 파일, subshell 안전) ─────────────────────────────────
+RESULTS_TMP=$(mktemp "/tmp/sysdr-results-XXXXXX.tsv")
+COUNTS_TMP=$(mktemp "/tmp/sysdr-counts-XXXXXX.txt")
+trap 'rm -f "$RESULTS_TMP" "$COUNTS_TMP"' EXIT
+echo "0 0" > "$COUNTS_TMP"   # ok warn_fail
+
+add_result() {
+  local item="$1" status="$2" note="$3"
+  printf '%s\t%s\t%s\n' "$item" "$status" "$note" >> "$RESULTS_TMP"
+  read -r ok wf < "$COUNTS_TMP"
+  if [[ "$status" == "OK" ]]; then
+    echo "$((ok+1)) $wf" > "$COUNTS_TMP"
+  else
+    echo "$ok $((wf+1))" > "$COUNTS_TMP"
+  fi
+}
+
+# ── 1. LaunchAgents / PM2 서비스 ─────────────────────────────────────────────
+check_launchagents() {
+  if $IS_MACOS; then
+    local launchd_out
+    launchd_out=$(launchctl list 2>/dev/null || echo "")
+
+    for svc in "ai.jarvis.discord-bot" "ai.jarvis.watchdog"; do
+      local line pid
+      line=$(echo "$launchd_out" | grep "$svc" || echo "")
+      if [[ -z "$line" ]]; then
+        add_result "launchd:$svc" "FAIL" "not loaded"
+      else
+        pid=$(echo "$line" | awk '{print $1}')
+        if [[ "$pid" =~ ^[0-9]+$ ]] && [[ "$pid" -gt 0 ]]; then
+          add_result "launchd:$svc" "OK" "PID $pid"
+        else
+          local ec
+          ec=$(echo "$line" | awk '{print $2}')
+          add_result "launchd:$svc" "FAIL" "not running (exit=$ec)"
+        fi
+      fi
+    done
+
+    # Glances LaunchAgent
+    # 2026-07-27 정정: 실제 등록명은 ai.openclaw.glances 다. ai.jarvis.glances 를 찾고 있어
+    # 7일 내내 "not loaded" 오탐이 떴다(실측: ls ~/Library/LaunchAgents | grep glances).
+    if echo "$launchd_out" | grep -q "ai.openclaw.glances"; then
+      add_result "launchd:glances" "OK" "loaded"
+    else
+      add_result "launchd:glances" "WARN" "not loaded"
+    fi
+
+    # plist 스크립트 존재 검증
+    local missing_scripts=()
+    local la_dir="$HOME/Library/LaunchAgents"
+    if [[ -d "$la_dir" ]]; then
+      while IFS= read -r plist; do
+        local script_path
+        script_path=$(python3 -c "
+import plistlib, sys
+try:
+  d = plistlib.load(open('$plist', 'rb'))
+  args = d.get('ProgramArguments', [])
+  print(args[0] if args else '')
+except: print('')
+" 2>/dev/null || echo "")
+        if [[ -n "$script_path" && ! -f "$script_path" ]]; then
+          local svc_name
+          svc_name=$(basename "$plist" .plist | sed 's/^ai\.jarvis\.//')
+          missing_scripts+=("$svc_name")
+        fi
+      done < <(find "$la_dir" -maxdepth 1 -name 'ai.jarvis.*.plist' 2>/dev/null)
+    fi
+    if [[ ${#missing_scripts[@]} -gt 0 ]]; then
+      add_result "launchd:config-debt" "WARN" "스크립트 없음: ${missing_scripts[*]}"
+    fi
+  else
+    # Linux/WSL2: PM2 서비스 상태 확인
+    if ! command -v pm2 &>/dev/null; then
+      add_result "pm2" "FAIL" "pm2 not installed"
+      return
+    fi
+    for svc in "jarvis-bot" "jarvis-watchdog"; do
+      local status
+      status=$(pm2 jlist 2>/dev/null | python3 -c "
+import json,sys
+try:
+  procs=json.load(sys.stdin)
+  match=[p for p in procs if p['name']=='$svc']
+  print(match[0]['pm2_env']['status'] if match else 'not_found')
+except: print('error')
+" 2>/dev/null || echo "error")
+      case "$status" in
+        online)    add_result "pm2:$svc" "OK" "online" ;;
+        not_found) add_result "pm2:$svc" "FAIL" "not registered" ;;
+        *)         add_result "pm2:$svc" "FAIL" "status=$status" ;;
+      esac
+    done
+  fi
+}
+
+# ── 2. Discord 봇 메모리 ─────────────────────────────────────────────────────
+check_discord_bot() {
+  local pid mem_mb
+  if $IS_MACOS; then
+    pid=$(launchctl list 2>/dev/null | awk '/ai\.jarvis\.discord-bot/{print $1}' | grep -E '^[0-9]+$' | head -1 || echo "")
+  else
+    pid=$(pgrep -f "discord-bot.js" 2>/dev/null | head -1 || echo "")
+  fi
+  if [[ -z "$pid" ]]; then
+    add_result "discord-bot" "FAIL" "no PID"
+    return
+  fi
+  local rss_kb
+  rss_kb=$(ps -p "$pid" -o rss= 2>/dev/null | tr -d ' ' || echo "0")
+  mem_mb=$(( ${rss_kb:-0} / 1024 ))
+  if [[ "$mem_mb" -gt 500 ]]; then
+    add_result "discord-bot" "WARN" "PID=$pid RSS=${mem_mb}MB (high)"
+  else
+    add_result "discord-bot" "OK" "PID=$pid RSS=${mem_mb}MB"
+  fi
+
+  # crash count
+  local crashes=0
+  if [[ -f "$BOT_HOME/watchdog/crash-count" ]]; then
+    crashes=$(cat "$BOT_HOME/watchdog/crash-count" 2>/dev/null || echo "0")
+  fi
+  if [[ "$crashes" -gt 3 ]]; then
+    add_result "crash-count" "WARN" "${crashes}회"
+  fi
+}
+
+# ── 3. RAG / LanceDB ─────────────────────────────────────────────────────────
+check_rag() {
+  local node_out
+  # BOT_HOME을 env var로 전달 — 하드코딩 경로 제거
+  local node_script='
+const { createRequire } = await import("module");
+const require = createRequire("file:///");
+const BOT_HOME = process.env.BOT_HOME || (process.env.HOME + "/jarvis/runtime");
+const ldb = require(BOT_HOME + "/discord/node_modules/@lancedb/lancedb/dist/index.js");
+const db = await ldb.connect(BOT_HOME + "/rag/lancedb");
+try {
+  const t = await db.openTable("documents");
+  const n = await t.countRows();
+  console.log("chunks:" + n);
+} catch(e) { console.log("ERROR:" + e.message.slice(0,60)); }
+'
+  if [[ -n "$TIMEOUT_CMD" ]]; then
+    node_out=$(NODE_PATH="$BOT_HOME/discord/node_modules" \
+      $TIMEOUT_CMD 20 node --input-type=module <<< "$node_script" 2>/dev/null || echo "ERROR:timeout")
+  else
+    node_out=$(NODE_PATH="$BOT_HOME/discord/node_modules" \
+      node --input-type=module <<< "$node_script" 2>/dev/null || echo "ERROR:node_failed")
+  fi
+
+  if echo "$node_out" | grep -q "^ERROR"; then
+    add_result "rag-lancedb" "FAIL" "$node_out"
+  else
+    local chunks
+    chunks=$(echo "$node_out" | grep -oE 'chunks:[0-9]+' | grep -oE '[0-9]+' || echo "0")
+    if [[ "${chunks:-0}" -eq 0 ]]; then
+      add_result "rag-lancedb" "FAIL" "0 chunks"
+    elif [[ "${chunks:-0}" -lt 500 ]]; then
+      add_result "rag-lancedb" "WARN" "${chunks} chunks (낮음)"
+    else
+      add_result "rag-lancedb" "OK" "${chunks} chunks"
+    fi
+  fi
+
+  # 최근 인덱싱 시간
+  if [[ -f "$BOT_HOME/logs/rag-index.log" ]]; then
+    local last_idx
+    last_idx=$(tail -3 "$BOT_HOME/logs/rag-index.log" 2>/dev/null | tail -1 || echo "")
+    log "RAG 최근 인덱싱: $last_idx"
+  fi
+}
+
+# ── 4. 크론 에러 (최근 24시간) ───────────────────────────────────────────────
+# task_XXXXXX_ 패턴: dev-task-daemon이 생성하는 임시 태스크 ID.
+# 구조적 크론 스크립트 오류가 아니므로 집계에서 제외한다.
+check_cron_errors() {
+  if [[ ! -f "$BOT_HOME/logs/cron.log" ]]; then
+    add_result "cron-errors" "OK" "로그 없음"
+    return
+  fi
+  local cutoff
+  cutoff=$(date -v-24H '+%Y-%m-%d %H:%M:%S' 2>/dev/null \
+    || date -d '24 hours ago' '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "")
+
+  local err_count task_count
+  if [[ -n "$cutoff" ]]; then
+    err_count=$(grep -E 'FAILED|ERROR|CRITICAL' "$BOT_HOME/logs/cron.log" 2>/dev/null \
+      | grep -vE 'task_[0-9]+_' \
+      | awk -v c="[$cutoff" '$0 >= c' | wc -l) || err_count=0
+    task_count=$(grep -E 'FAILED|ERROR|CRITICAL' "$BOT_HOME/logs/cron.log" 2>/dev/null \
+      | grep -E 'task_[0-9]+_' \
+      | awk -v c="[$cutoff" '$0 >= c' | wc -l) || task_count=0
+  else
+    err_count=$(grep -E 'FAILED|ERROR|CRITICAL' "$BOT_HOME/logs/cron.log" 2>/dev/null \
+      | grep -vE 'task_[0-9]+_' | wc -l) || err_count=0
+    task_count=$(grep -E 'FAILED|ERROR|CRITICAL' "$BOT_HOME/logs/cron.log" 2>/dev/null \
+      | grep -E 'task_[0-9]+_' | wc -l) || task_count=0
+  fi
+  err_count=$((${err_count:-0}))
+  task_count=$((${task_count:-0}))
+
+  local task_note=""
+  if [[ "$task_count" -gt 0 ]]; then
+    task_note=" (+task ${task_count}건 제외)"
+  fi
+
+  if (( err_count > 10 )); then
+    add_result "cron-errors" "FAIL" "24h ${err_count}건${task_note}"
+  elif (( err_count > 0 )); then
+    add_result "cron-errors" "WARN" "24h ${err_count}건${task_note}"
+  else
+    add_result "cron-errors" "OK" "에러 없음${task_note}"
+  fi
+}
+
+# ── 5. E2E 테스트 결과 ───────────────────────────────────────────────────────
+check_e2e() {
+  if [[ ! -f "$BOT_HOME/logs/e2e-cron.log" ]]; then
+    add_result "e2e" "WARN" "아직 미실행"
+    return
+  fi
+  local pass fail total
+  pass=$(grep -c 'PASS' "$BOT_HOME/logs/e2e-cron.log" 2>/dev/null) || pass=0
+  fail=$(grep -c 'FAIL' "$BOT_HOME/logs/e2e-cron.log" 2>/dev/null) || fail=0
+  total=$(( pass + fail ))
+  if (( fail >= 3 )); then
+    add_result "e2e" "FAIL" "${fail}개 실패 / 전체 ${total}"
+  elif (( fail > 0 )); then
+    add_result "e2e" "WARN" "${fail}개 실패 / 전체 ${total}"
+  else
+    add_result "e2e" "OK" "${pass}/${total} 통과"
+  fi
+}
+
+# ── 6. Glances API ──────────────────────────────────────────────────────────
+check_glances() {
+  local cpu_info
+  if [[ -n "$TIMEOUT_CMD" ]]; then
+    cpu_info=$($TIMEOUT_CMD 5 curl -sf "http://localhost:61208/api/4/cpu" 2>/dev/null \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'CPU {d[\"total\"]}%')" 2>/dev/null || echo "")
+  else
+    cpu_info=$(curl -sf --max-time 5 "http://localhost:61208/api/4/cpu" 2>/dev/null \
+      | python3 -c "import sys,json; d=json.load(sys.stdin); print(f'CPU {d[\"total\"]}%')" 2>/dev/null || echo "")
+  fi
+  if [[ -z "$cpu_info" ]]; then
+    add_result "glances" "FAIL" "응답없음"
+  else
+    add_result "glances" "OK" "$cpu_info"
+  fi
+}
+
+# ── 7. CLI 도구 ──────────────────────────────────────────────────────────────
+check_cli_tools() {
+  local missing=()
+  command -v memo >/dev/null 2>&1 || missing+=("memo")
+  command -v gog >/dev/null 2>&1 || missing+=("gog")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    add_result "cli-tools" "WARN" "없음: ${missing[*]}"
+  else
+    add_result "cli-tools" "OK" "memo/gog 정상"
+  fi
+}
+
+# ── 8. 디스크 ────────────────────────────────────────────────────────────────
+check_disk() {
+  local pct
+  pct=$(df / | awk 'NR==2 {gsub(/%/,"",$5); print $5+0}' 2>/dev/null || echo "0")
+  if [[ "$pct" -gt 90 ]]; then
+    add_result "disk" "FAIL" "${pct}% 사용"
+  elif [[ "$pct" -gt 80 ]]; then
+    add_result "disk" "WARN" "${pct}% 사용"
+  else
+    add_result "disk" "OK" "${pct}% 사용"
+  fi
+}
+
+# ── 9. claude 직접 호출 격리 가드 (2026-06-11 신설) ──────────────────────────
+# 배치 스크립트가 격리 토큰 없이 claude를 직접 호출하면 대화형 CLI와 토큰 갱신 경쟁
+# → 세션 강제 로그아웃 사고 재발 (oauth-incident-ledger cli-login-session-expired-20260611).
+# 신규 위반 스크립트가 생기면 WARN으로 적발한다.
+check_claude_isolation() {
+  local viol=0 names=""
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    grep -qE "CLAUDE_CODE_OAUTH_TOKEN|llm-gateway|ask-claude" "$f" && continue
+    case "$(basename "$f")" in
+      # 화이트리스트 (2026-06-11 전수 판정 — 에이전트 2차 분류 + 실측):
+      # ① 인증 점검 도구 — 메인 credentials 검사가 본래 목적
+      pre-cron-auth-check.sh|boot-auth-check.sh|token-health-check.sh|claude-switch.sh) continue ;;
+      # ② bot-cron/게이트웨이 격리 주입 경로 경유 또는 claude 실호출 없음(오탐)
+      macro-briefing.sh|coder-functions.sh|extras-gateway.mjs|health-gateway.mjs) continue ;;
+      watchdog.sh|health-check.sh|bot-self-restart.sh) continue ;;
+      # ③ 대화형 TUI — 메인 credentials 사용이 정당 (배치 아님)
+      chat.mjs) continue ;;
+      # ④ 인증 검사가 목적인 스크립트 — 메인 credentials 유효성을 확인하는 것이 임무이므로
+      #    격리 토큰을 주입하면 검사 자체가 무의미해진다 (2026-07-27 등재)
+      boot-auth-check.sh|token-health-check.sh|pre-cron-auth-check.sh) continue ;;
+    esac
+    # 2026-07-27: 격리를 실제로 적용한 파일은 통과시킨다.
+    # 종전에는 예외 목록에 없으면 무조건 위반으로 셌기 때문에,
+    # isolatedClaudeEnv()/격리 토큰 주입을 넣어도 계속 위반으로 남았다.
+    if grep -qE 'isolatedClaudeEnv|CLAUDE_CODE_OAUTH_TOKEN|llm-gateway' "$f" 2>/dev/null; then
+      continue
+    fi
+    viol=$((viol + 1))
+    names="${names}$(basename "$f") "
+  done < <(
+    # 2026-07-27: 주석·안내문구까지 잡아 영구 오탐을 내던 것을 정정.
+    # 1차로 파일을 추리고, 주석(#, //)을 제거한 뒤에도 매치가 남는 파일만 위반으로 본다.
+    # 실측 — 이 보정 전에는 claude-switch.sh(안내 메시지), model-routing-integration.sh(주석),
+    # gen-system-overview.sh(문서 문자열)가 매번 위반으로 집계됐다.
+    grep -rlE 'spawnSync\(CLAUDE_BIN|\.local/bin/claude.{0,40}(-p|--print)|claude (-p|--print)' \
+      "$HOME/jarvis/infra/scripts" "$HOME/jarvis/infra/lib" 2>/dev/null \
+      | grep -vE '\.bak|\.LOCKED|node_modules|\.md$|\.disabled' \
+      | while read -r _cand; do
+          # 주석 제거 + 출력문(echo/printf/문서생성 헬퍼/마크다운 표) 제외 후에도 남으면 실제 호출.
+          # 실측 오탐 사례 — claude-switch.sh L248은 echo 안내문,
+          # gen-system-overview.sh L118·L190은 문서에 박는 설명 문자열이었다.
+          if sed -e 's/#.*//' -e 's|//.*||' "$_cand" 2>/dev/null \
+             | grep -vE '^[[:space:]]*(echo|printf|_r )|^\|' \
+             | grep -qE 'spawnSync\(CLAUDE_BIN|\.local/bin/claude.{0,40}(-p|--print)|claude (-p|--print)'; then
+            printf '%s\n' "$_cand"
+          fi
+        done || true)
+  if [[ "$viol" -gt 0 ]]; then
+    add_result "claude-격리" "WARN" "${viol}건 우회 호출: ${names:0:80}"
+  else
+    add_result "claude-격리" "OK" "전 배치 격리 토큰 경유"
+  fi
+}
+
+# ── 10. 학습 소비처 등기소 검사 (2026-06-11 신설) ─────────────────────────────
+# 학습 산출물(오답노트·체크리스트·통찰·ralph)이 "생산만 되고 아무도 안 읽는"
+# 구조 단절을 적발한다. 등기부(learning-consumer-registry.json) 각 항목에 대해
+# ① artifact 존재 ② 소비처 파일 존재 ③ 소비처가 artifact 경로/이름을 참조하는지 grep
+# 3중 검사 — 실패 항목은 WARN. optional=true(선등기)는 artifact 미생성 시
+# 조용히 통과시켜 영구 오탐을 방지한다 (설계 v2 결함 3 정정).
+check_learning_consumers() {
+  local REG="$HOME/jarvis/runtime/config/learning-consumer-registry.json"
+  if [[ ! -f "$REG" ]]; then
+    add_result "학습-소비처" "WARN" "등기부 부재: learning-consumer-registry.json"
+    return
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    add_result "학습-소비처" "WARN" "jq 없음 — 검사 불가"
+    return
+  fi
+  if ! jq empty "$REG" 2>/dev/null; then
+    add_result "학습-소비처" "WARN" "등기부 JSON 파싱 실패"
+    return
+  fi
+
+  local total=0 issues=0 notes=""
+  local id apath kind optional cfile cref ctype
+
+  # ① artifact 존재 검사 — kind=dir은 디렉토리, 그 외는 파일로 판정.
+  #    optional=true는 미생성 허용 (경로만 선등기한 항목).
+  while IFS=$'\t' read -r id apath kind optional; do
+    [[ -z "$id" ]] && continue
+    total=$((total + 1))
+    apath="${apath/#\~/$HOME}"
+    local a_ok=true
+    if [[ "$kind" == "dir" ]]; then
+      [[ -d "$apath" ]] || a_ok=false
+    else
+      [[ -f "$apath" ]] || a_ok=false
+    fi
+    if ! $a_ok && [[ "$optional" != "true" ]]; then
+      issues=$((issues + 1))
+      notes="${notes}${id}:산출물없음; "
+    fi
+  done < <(jq -r '.artifacts[] | [.id, .path, (.kind // "file"), ((.optional // false)|tostring)] | @tsv' "$REG" 2>/dev/null)
+
+  # ② + ③ 소비처 검사 — 파일 존재 + artifact 참조(ref 문자열) grep.
+  #    kind=archive는 보관용(소비처 부재가 정상)이라 면제.
+  #    optional artifact가 아직 미생성이면 소비처 검사 생략 — 생성 시점부터 발효.
+  #    비파일 소비처(type 마커, 예: claude-code-rules-autoload)는 grep 불가 → 통과.
+  while IFS=$'\t' read -r id apath kind optional cfile cref ctype; do
+    [[ -z "$id" ]] && continue
+    [[ "$kind" == "archive" ]] && continue
+    apath="${apath/#\~/$HOME}"
+    if [[ "$optional" == "true" ]]; then
+      if [[ "$kind" == "dir" ]]; then
+        [[ -d "$apath" ]] || continue
+      else
+        [[ -f "$apath" ]] || continue
+      fi
+    fi
+    if [[ -z "$cfile" && -n "$ctype" ]]; then
+      continue
+    fi
+    cfile="${cfile/#\~/$HOME}"
+    if [[ ! -f "$cfile" ]]; then
+      issues=$((issues + 1))
+      notes="${notes}${id}:소비처없음($(basename "$cfile")); "
+      continue
+    fi
+    if [[ -n "$cref" ]] && ! grep -qF -- "$cref" "$cfile" 2>/dev/null; then
+      issues=$((issues + 1))
+      notes="${notes}${id}:참조누락($(basename "$cfile")); "
+    fi
+  done < <(jq -r '.artifacts[] | .id as $i | .path as $p | (.kind // "file") as $k | ((.optional // false)|tostring) as $o | (.consumers // [])[]? | [$i, $p, $k, $o, (.file // ""), (.ref // ""), (.type // "")] | @tsv' "$REG" 2>/dev/null)
+
+  if [[ "$issues" -gt 0 ]]; then
+    add_result "학습-소비처" "WARN" "${issues}건 단절: ${notes:0:110}"
+  else
+    add_result "학습-소비처" "OK" "artifact ${total}종 소비 연결 실재"
+  fi
+}
+
+# ── 모든 체크 실행 ────────────────────────────────────────────────────────────
+log "system-doctor 시작"
+
+check_launchagents
+check_discord_bot
+check_rag
+check_cron_errors
+check_e2e
+check_glances
+check_cli_tools
+check_disk
+check_claude_isolation
+check_learning_consumers
+
+read -r ok wf < "$COUNTS_TMP"
+log "점검 완료 — OK:$ok WARN/FAIL:$wf"
+
+# ── 원장 적재 (cron-scan) ─────────────────────────────────────────────────────
+# 2026-04-25 verify Agent 적발: cron 매일 06:00 실행 결과가 doctor-ledger.jsonl에
+# 안 적재되어 주간 audit이 운영 추세를 못 봄. type:"cron-scan"으로 명시 적재.
+LEDGER="${HOME}/jarvis/runtime/state/doctor-ledger.jsonl"
+if command -v jq >/dev/null 2>&1; then
+  # overall 판정: wf=0 → green / wf<3 → yellow / 그 외 → red
+  if (( wf == 0 )); then overall="green"
+  elif (( wf < 3 )); then overall="yellow"
+  else overall="red"; fi
+
+  # FAIL 항목 개수 (RESULTS_TMP에서 status==FAIL 카운트)
+  fail_count=$(awk -F'\t' '$2=="FAIL"' "$RESULTS_TMP" 2>/dev/null | wc -l | tr -d ' ')
+  warn_count=$(awk -F'\t' '$2=="WARN"' "$RESULTS_TMP" 2>/dev/null | wc -l | tr -d ' ')
+
+  if jq -cn \
+       --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+       --arg type "cron-scan" \
+       --arg overall "$overall" \
+       --arg runner "system-doctor.sh" \
+       --argjson ok "${ok:-0}" \
+       --argjson warn "${warn_count:-0}" \
+       --argjson fail "${fail_count:-0}" \
+       '{ts:$ts, type:$type, runner:$runner, overall:$overall, ok:$ok, warn:$warn, fail:$fail}' \
+       >> "$LEDGER" 2>>"$LOG"; then
+    log "ledger appended ($overall ok=$ok warn=$warn_count fail=$fail_count)"
+  else
+    log "ledger append FAILED — check $LEDGER permissions"
+  fi
+else
+  log "ledger skip — jq not found"
+fi
+
+# ── 결과 포맷팅 ───────────────────────────────────────────────────────────────
+if [[ "$wf" -eq 0 ]]; then
+  log "all OK — silent (이상 없으면 Discord 전송 안 함)"
+  exit 0
+fi
+
+# WARN/FAIL 있으면 상세 리포트
+REPORT="━━━━━━━━━━━━━━━━━━━━
+🩺 Jarvis 점검 — $(date '+%m-%d %H:%M')
+━━━━━━━━━━━━━━━━━━━━
+✅ 정상: ${ok}개  |  ⚠️ 이상: ${wf}개
+"
+
+ISSUES=""
+OKSUMMARY=""
+while IFS=$'\t' read -r item status note; do
+  if [[ "$status" == "OK" ]]; then
+    OKSUMMARY="${OKSUMMARY}  ✅ ${item}: ${note}\n"
+  elif [[ "$status" == "WARN" ]]; then
+    ISSUES="${ISSUES}  ⚠️ ${item}: ${note}\n"
+  else
+    ISSUES="${ISSUES}  ❌ ${item}: ${note}\n"
+  fi
+done < "$RESULTS_TMP"
+
+if [[ -n "$ISSUES" ]]; then
+  REPORT="${REPORT}
+[이상 항목]
+$(printf '%b' "$ISSUES")"
+fi
+
+if [[ -n "$OKSUMMARY" ]]; then
+  REPORT="${REPORT}
+[정상 항목]
+$(printf '%b' "$OKSUMMARY")"
+fi
+
+REPORT="${REPORT}━━━━━━━━━━━━━━━━━━━━"
+
+log "Discord 전송 (이상 ${wf}건)"
+
+# 시각화 카드 전송 (TSV → JSON → discord-visual.mjs)
+VISUAL_SCRIPT="$BOT_HOME/scripts/discord-visual.mjs"
+if command -v node >/dev/null 2>&1 && [[ -f "$VISUAL_SCRIPT" ]]; then
+  ITEMS_JSON=$(python3 -c "
+import sys, json
+rows = []
+for line in open('${RESULTS_TMP}'):
+    parts = line.rstrip('\n').split('\t')
+    if len(parts) >= 3:
+        rows.append({'item': parts[0], 'status': parts[1], 'note': parts[2]})
+print(json.dumps({'items': rows, 'ok': ${ok}, 'warn': ${wf}, 'timestamp': '$(date '+%Y-%m-%d %H:%M')'}))
+" 2>/dev/null || echo "")
+  # 2026-07-27 소음 감축: 상태가 바뀔 때만 보낸다 (edge-triggered).
+  # 실측 배경 — 이 카드가 7일 490건(일 70건)으로 전체 알림의 44%를 차지했고,
+  # 로그상 매 실행이 "이상 5건"으로 동일했다. 즉 같은 내용을 하루 70번 반복 발송했다.
+  # 시그니처는 OK가 아닌 항목의 이름 목록. 이상 구성이 바뀌거나 정상으로 복귀할 때만 발송된다.
+  _AG="${BOT_HOME}/lib/alert-gate.sh"
+  # shellcheck source=/dev/null
+  [[ -f "$_AG" ]] && source "$_AG" 2>/dev/null || true
+  _sig=$(awk -F'\t' 'toupper($2) != "OK" {print $1}' "$RESULTS_TMP" 2>/dev/null | sort | tr '\n' ',')
+  _gate_ok=0
+  if declare -F alert_gate >/dev/null 2>&1; then
+    alert_gate "system-doctor" "${wf:-0}" "$_sig" || _gate_ok=1
+  fi
+
+  if [[ "$_gate_ok" == "1" ]]; then
+    log "Discord 발송 억제 — 상태 무변화 (이상 ${wf}건 동일, 누적 $(alert_gate_suppressed system-doctor)회 억제)"
+  elif [[ -n "$ITEMS_JSON" ]]; then
+    node "$VISUAL_SCRIPT" --type system-doctor --data "$ITEMS_JSON" --channel jarvis-system \
+      2>>"$LOG" || true
+  else
+    [[ -f "$ROUTE" ]] && "$ROUTE" discord system-doctor "$REPORT" jarvis-system 2>/dev/null || true
+  fi
+else
+  [[ -f "$ROUTE" ]] && "$ROUTE" discord system-doctor "$REPORT" jarvis-system 2>/dev/null || true
+fi

@@ -1,0 +1,266 @@
+#!/usr/bin/env bash
+# skill-synthesis-verify.sh
+# council-insight(23:05 KST) 실행 후 10분 뒤(23:15 KST) SKILL_JSON 합성 결과 자동 검증
+set -euo pipefail
+
+SKILLS_FILE="${HOME}/jarvis/runtime/skills/skills.jsonl"
+BOT_LOG="${HOME}/jarvis/runtime/logs/council-insight.log"
+TODAY=$(TZ=Asia/Seoul date '+%Y-%m-%d')
+KST=$(TZ=Asia/Seoul date '+%H:%M KST')
+
+echo "### 🔬 SKILL 합성 검증 — ${TODAY} ${KST}"
+echo ""
+
+# 1. council-insight 오늘 실행 여부 (로그에서 태스크 ID 확인)
+ci_ran=$(grep "council-insight" "$BOT_LOG" 2>/dev/null | grep "$(date '+%Y-%m-%d')\|오늘\|DONE\|완료\|\[B1\]\|SKILL_JSON\|EUREKA_JSON" | tail -1 || true)
+ci_log_tail=$(grep "council-insight" "$BOT_LOG" 2>/dev/null | tail -1 || true)
+if [[ -n "$ci_log_tail" ]]; then
+    echo "✅ council-insight 최근 로그: $(echo "$ci_log_tail" | cut -c1-120)"
+else
+    echo "⚠️ council-insight 로그 없음 — 오늘 미실행 가능성"
+fi
+echo ""
+
+# 2. SKILL_JSON 합성 로그 확인 (오늘자 기준)
+skill_log=$(grep "SKILL_JSON 자동 합성" "$BOT_LOG" 2>/dev/null | tail -3 || true)
+if [[ -n "$skill_log" ]]; then
+    echo "✅ SKILL_JSON 합성 감지:"
+    while IFS= read -r line; do echo "  $line"; done <<< "$skill_log"
+else
+    echo "ℹ️ SKILL_JSON 합성 로그 없음"
+    echo "  → LLM이 오늘 재사용 패턴을 발견하지 못한 경우 정상 (강제 출력 금지 설계)"
+fi
+echo ""
+
+# 3. skills.jsonl 현황
+if [[ -f "$SKILLS_FILE" ]]; then
+    today_count=$(grep -c "\"${TODAY}" "$SKILLS_FILE" 2>/dev/null) || today_count=0
+    total_count=$(wc -l < "$SKILLS_FILE" 2>/dev/null | tr -d ' ') || total_count=0
+    echo "📚 skills.jsonl — 오늘 **${today_count}건** / 누계 **${total_count}건**"
+    if [[ "$today_count" -gt 0 ]]; then
+        echo ""
+        echo "오늘 적재된 Skill:"
+        grep "\"${TODAY}" "$SKILLS_FILE" 2>/dev/null \
+            | jq -r '"  - [" + .type + "] " + .title' 2>/dev/null \
+            || grep "\"${TODAY}" "$SKILLS_FILE" | head -3
+    fi
+else
+    echo "⚠️ skills.jsonl 파일 없음 — 한 번도 적재된 적 없음"
+fi
+echo ""
+
+# 4. EUREKA_JSON 처리 확인
+eureka_log=$(grep "EUREKA_JSON 적재" "$BOT_LOG" 2>/dev/null | tail -2 || true)
+if [[ -n "$eureka_log" ]]; then
+    echo "✅ EUREKA_JSON: $(echo "$eureka_log" | tail -1 | cut -c1-100)"
+else
+    echo "ℹ️ EUREKA_JSON 적재 없음 (council-insight가 EUREKA 미출력 시 정상)"
+fi
+
+echo ""
+
+# 5. 📊 GRADER — 오늘 적재된 Skill 품질 평가 (Hermes GEPA 경량 구현)
+GRADES_FILE="${HOME}/jarvis/runtime/skills/grades.jsonl"
+mkdir -p "${HOME}/jarvis/runtime/skills"
+
+if [[ -f "$SKILLS_FILE" ]]; then
+    today_skills=$(grep "\"${TODAY}" "$SKILLS_FILE" 2>/dev/null || true)
+    if [[ -n "$today_skills" ]]; then
+        echo "### 📊 품질 평가 (Grader)"
+        grade_count=0
+        while IFS= read -r skill; do
+            [[ -z "$skill" ]] && continue
+            skill_id=$(echo "$skill" | jq -r '.id // "unknown"' 2>/dev/null || true)
+            title=$(echo "$skill" | jq -r '.title // ""' 2>/dev/null || true)
+            pattern=$(echo "$skill" | jq -r '.pattern // ""' 2>/dev/null || true)
+            evidence=$(echo "$skill" | jq -r '.evidence // [] | length' 2>/dev/null || echo 0)
+            reusable=$(echo "$skill" | jq -r '.reusable_in // [] | length' 2>/dev/null || echo 0)
+            skill_type=$(echo "$skill" | jq -r '.type // ""' 2>/dev/null || true)
+
+            score=0
+            # 기준 1: title 길이 10~40자
+            title_len=${#title}
+            [[ "$title_len" -ge 10 && "$title_len" -le 40 ]] && score=$((score+1))
+            # 기준 2: pattern ≥ 30자
+            pattern_len=${#pattern}
+            [[ "$pattern_len" -ge 30 ]] && score=$((score+1))
+            # 기준 3: evidence 1개 이상
+            [[ "$evidence" -ge 1 ]] && score=$((score+1))
+            # 기준 4: reusable_in 1개 이상
+            [[ "$reusable" -ge 1 ]] && score=$((score+1))
+            # 기준 5: 유효한 type enum
+            case "$skill_type" in
+                pattern|insight|correction|anti-pattern) score=$((score+1)) ;;
+            esac
+
+            if [[ "$score" -ge 3 ]]; then
+                grade_label="✅ PASS"
+            else
+                grade_label="⚠️ FAIL"
+            fi
+            echo "  ${grade_label} [${score}/5] ${title:-$skill_id}"
+
+            # grades.jsonl 적재
+            grade_ts=$(TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:%S+09:00')
+            grade_entry=$(jq -cn \
+                --arg id "$skill_id" \
+                --arg date "$TODAY" \
+                --arg ts "$grade_ts" \
+                --argjson score "$score" \
+                --arg title "$title" \
+                '{id:$id, date:$date, ts:$ts, score:$score, title:$title}')
+            echo "$grade_entry" >> "$GRADES_FILE"
+            grade_count=$((grade_count+1))
+        done <<< "$today_skills"
+        echo "  → ${grade_count}건 평가 완료 | grades.jsonl 적재"
+    else
+        echo "### 📊 품질 평가 (Grader)"
+        echo "  ℹ️ 오늘 적재된 Skill 없음 — 평가 생략"
+    fi
+else
+    echo "### 📊 품질 평가 (Grader)"
+    echo "  ℹ️ skills.jsonl 없음 — 평가 생략"
+fi
+echo ""
+
+# 6. 🧬 EVOLUTION SIGNAL — 최근 5건 평균 점수 < 3.0 시 PROMPT_IMPROVE 신호
+echo "### 🧬 진화 신호 (Evolution Signal)"
+if [[ -f "$GRADES_FILE" ]]; then
+    total_entries=$(wc -l < "$GRADES_FILE" 2>/dev/null | tr -d ' ' || echo 0)
+    if [[ "$total_entries" -ge 3 ]]; then
+        # 최근 5건 점수 평균 (Python3 — bc보다 float 안정적)
+        avg_score=$(tail -5 "$GRADES_FILE" | jq -r '.score' | \
+            python3 -c "import sys; nums=[float(l) for l in sys.stdin if l.strip()]; print(f'{sum(nums)/len(nums):.2f}' if nums else '0')" 2>/dev/null || echo "0")
+        actual_count=$(tail -5 "$GRADES_FILE" | wc -l | tr -d ' \n')
+        echo "  최근 ${actual_count}건 평균 점수: **${avg_score} / 5.0**"
+
+        # Python3 float 비교
+        needs_improve=$(python3 -c "print('yes' if float('${avg_score}') < 3.0 else 'no')" 2>/dev/null || echo "no")
+        if [[ "$needs_improve" == "yes" ]]; then
+            echo ""
+            echo "  ⚠️ 평균 점수 3.0 미만 → PROMPT_IMPROVE 신호 발동"
+            echo ""
+            echo "  **PROMPT_IMPROVE** (council-insight 프롬프트 개선 권고):"
+            echo "  → SKILL_JSON 출력 시 'pattern' 필드를 30자 이상 구체적으로 기술하도록 지시 강화"
+            echo "  → 'evidence' 배열에 반드시 파일 경로 또는 명령 출력 1개 이상 포함 지시"
+            echo "  → 'reusable_in' 항목을 최소 2개 이상 예시로 제시하도록 지시"
+            echo "  → title은 10~40자, 재사용 가능한 구조를 담아 작성하도록 지시"
+            echo ""
+            echo "  💡 council-insight.md promptFile의 SKILL_JSON 가이드라인 섹션을 위 기준으로 업데이트하십시오."
+            echo "  → 결재: L4 (대표님) 승인 후 반영"
+        else
+            echo "  ✅ 평균 점수 3.0 이상 — 현재 프롬프트 품질 양호"
+        fi
+    else
+        echo "  ℹ️ grades.jsonl 데이터 없음 — 다음 실행 시 평가 시작"
+    fi
+else
+    echo "  ℹ️ grades.jsonl 없음 — 첫 평가 후 진화 신호 활성화"
+fi
+
+echo ""
+echo "---"
+echo "💡 0건이면 LLM이 패턴 없다고 판단 = 정상 동작. 3일 연속 0건이면 프롬프트 검토 권장."
+
+echo ""
+echo "### 🛡️ COMPLETION GUARD INTEGRATION (완료 검증 훅)"
+echo ""
+
+# 6-1. Cluster completion guard 호출 (cl-f6921eb1d5ea4c87 전용) — [2] 강제 증거 출력 가드
+#
+# 핵심 메커니즘:
+#   1. skills.jsonl에서 TODAY 패턴으로 모든 오늘 Skill 추출
+#   2. grades.jsonl에서 TODAY 필터로 실제 평가된 항목 정확히 계산
+#   3. "전체 N건 중 N건 처리 완료" 형식 강제 출력
+#   4. 부분 평가 시 exit code 1로 완료 선언 차단
+
+CLUSTER_GUARD_SCRIPT="${HOME}/jarvis/infra/scripts/cluster-completion-guard-cl-f6921eb1d5ea4c87.sh"
+if [[ -f "$CLUSTER_GUARD_SCRIPT" ]]; then
+    # council-insight 작업의 SKILL 합성 완료 여부 검증
+    today_skills=$(grep "\"${TODAY}" "$SKILLS_FILE" 2>/dev/null || true)
+
+    if [[ -n "$today_skills" ]]; then
+        expected_skills=$(echo "$today_skills" | wc -l | tr -d ' ')
+
+        # grades.jsonl에서 실제 평가된 항목 수 (엄격한 date 필드 기반)
+        if [[ -f "$GRADES_FILE" ]]; then
+            # date 필드에 TODAY를 포함하는 항목만 카운트 (타임스탬프 문제 방지)
+            evaluated_skills=$(python3 << PYTHON_EOF 2>/dev/null || echo 0
+import json
+import sys
+count = 0
+try:
+    with open("$GRADES_FILE", "r") as f:
+        for line in f:
+            if line.strip():
+                obj = json.loads(line)
+                if obj.get("date") == "$TODAY":
+                    count += 1
+except:
+    pass
+print(count)
+PYTHON_EOF
+)
+        else
+            evaluated_skills=0
+        fi
+
+        # [2] 강제 증거 출력 가드: 부분 완료 차단
+        #
+        # 로직:
+        #   - expected_skills == evaluated_skills: 모든 Skill 평가 완료 → PASS
+        #   - expected_skills > evaluated_skills: 부분 평가 감지 → FAIL + 부분 처리 오선언 방지
+
+        if bash "$CLUSTER_GUARD_SCRIPT" --verify --task "skill-synthesis-verify" \
+            --total "$expected_skills" --completed "$evaluated_skills" 2>&1; then
+            echo ""
+            echo "  ✅ Skill synthesis completion guard: PASS (${evaluated_skills}/${expected_skills} evaluated)"
+        else
+            echo ""
+            echo "  ❌ Skill synthesis completion guard: FAIL (${evaluated_skills}/${expected_skills} evaluated)"
+            echo "     → cl-f6921eb1d5ea4c87 클러스터 가드: 부분 평가 감지됨"
+            echo "     → 모든 오늘 생성된 Skill에 대한 평가 필수"
+            echo "     → 현황: 전체 ${expected_skills}건 중 ${evaluated_skills}건만 평가됨"
+        fi
+    else
+        echo "  ℹ️ Cluster completion guard: 오늘 Skill 없음 — 검증 생략"
+    fi
+    echo ""
+else
+    echo "  ⚠️ Cluster guard script not found: $CLUSTER_GUARD_SCRIPT"
+    echo ""
+fi
+
+# 7. 🔗 SKILL → wiki/_facts.md 브릿지 (학습된 패턴 봇 응답에 반영)
+FACTS_FILE="${HOME}/jarvis/runtime/wiki/ops/_facts.md"
+if [[ -f "$SKILLS_FILE" ]]; then
+    added_count=0
+    while IFS= read -r skill_line; do
+        [[ -z "$skill_line" ]] && continue
+        skill_id=$(echo "$skill_line" | jq -r '.id // ""' 2>/dev/null || true)
+        skill_date=$(echo "$skill_line" | jq -r '.date // "$TODAY"' 2>/dev/null || echo "$TODAY")
+        # 날짜에서 시간 부분 제거 (YYYY-MM-DD만 추출)
+        skill_date_short=$(echo "$skill_date" | cut -c1-10)
+        skill_title=$(echo "$skill_line" | jq -r '.title // ""' 2>/dev/null || true)
+        skill_pattern=$(echo "$skill_line" | jq -r '.pattern // ""' 2>/dev/null | head -c 120 || true)
+        skill_type=$(echo "$skill_line" | jq -r '.type // "pattern"' 2>/dev/null || true)
+
+        [[ -z "$skill_id" || -z "$skill_title" ]] && continue
+
+        # 중복 체크: skill_id가 이미 _facts.md에 있으면 스킵
+        if grep -q "source:skill.*$skill_id" "$FACTS_FILE" 2>/dev/null; then
+            continue
+        fi
+
+        # 팩트 형식으로 변환: - [날짜] [source:skill:ID] [type] 제목: 패턴요약
+        fact_line="- [${skill_date_short}] [source:skill:${skill_id}] [${skill_type}] ${skill_title}: ${skill_pattern}"
+        echo "$fact_line" >> "$FACTS_FILE"
+        added_count=$((added_count+1))
+    done < "$SKILLS_FILE"
+
+    if [[ "$added_count" -gt 0 ]]; then
+        echo "🔗 SKILL → wiki/_facts.md 브릿지: ${added_count}건 신규 적재"
+    else
+        echo "🔗 SKILL → wiki/_facts.md 브릿지: 신규 항목 없음 (모두 기적재)"
+    fi
+fi

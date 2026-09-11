@@ -1,0 +1,654 @@
+# JARVIS AI OPERATING SYSTEM
+
+# Application Logic Specification (MVP → Future Architecture)
+
+Version 1.0
+
+---
+
+# Purpose
+
+This document describes **how JARVIS thinks**, **how it processes requests**, and **how every subsystem communicates**.
+
+This is **NOT** a UI specification.
+
+This is **NOT** an API specification.
+
+This is the application's brain.
+
+The goal is to create an architecture where every future feature (agents, MCP servers, browser automation, voice, workflows, memory) plugs into a single orchestration engine instead of becoming isolated code.
+
+---
+
+# Core Philosophy
+
+JARVIS never "answers."
+
+JARVIS receives an objective.
+
+Then it decides:
+
+* What the user wants.
+* What information is required.
+* Which tools are needed.
+* Whether memory is relevant.
+* Whether a task should be saved.
+* Whether work should happen immediately or asynchronously.
+* What should be displayed back to the user.
+
+Everything is objective-driven.
+
+---
+
+# Mental Model
+
+The application behaves like this:
+
+```text
+User Intent
+      ↓
+Intent Analysis
+      ↓
+Context Collection
+      ↓
+Memory Retrieval
+      ↓
+Task Planning
+      ↓
+AI Generation
+      ↓
+Response Streaming
+      ↓
+Save Everything
+      ↓
+Update Dashboard
+```
+
+Every request follows this pipeline.
+
+---
+
+# Golden Rule
+
+The frontend never contains business logic.
+
+Frontend responsibilities:
+
+Display information
+
+Collect input
+
+Send events
+
+Render updates
+
+Backend responsibilities:
+
+Think
+
+Decide
+
+Store
+
+Execute
+
+Remember
+
+Log
+
+---
+
+# Global Event Flow
+
+Everything inside JARVIS is event-driven.
+
+Examples
+
+User sent message
+
+↓
+
+Chat Service receives
+
+↓
+
+Creates Message
+
+↓
+
+Publishes MessageCreated event
+
+↓
+
+AI Service receives event
+
+↓
+
+Generates response
+
+↓
+
+Publishes ResponseStreaming
+
+↓
+
+Frontend streams response
+
+↓
+
+Conversation updated
+
+↓
+
+Dashboard updated
+
+↓
+
+Memory updated
+
+↓
+
+Logs updated
+
+No module directly manipulates another module's data. Modules communicate through services/events.
+
+---
+
+# Request Lifecycle
+
+Every request enters the same pipeline.
+
+Example:
+
+"Build a landing page."
+
+Pipeline
+
+Receive request
+
+↓
+
+Validate input
+
+↓
+
+Determine project
+
+↓
+
+Retrieve recent conversation
+
+↓
+
+Retrieve project memory
+
+↓
+
+Construct Gemini prompt
+
+↓
+
+Send request
+
+↓
+
+Receive stream
+
+↓
+
+Save response
+
+↓
+
+Update conversation
+
+↓
+
+Create task entry
+
+↓
+
+Notify frontend
+
+---
+
+# Context Assembly
+
+Before calling Gemini, JARVIS assembles context.
+
+Priority order:
+
+1. Current message
+
+2. Previous messages
+
+3. Project summary
+
+4. Relevant memories
+
+5. User preferences
+
+6. System instructions
+
+7. Active files (metadata initially)
+
+This keeps prompts relevant without sending the entire conversation every time.
+
+---
+
+# Project Logic
+
+Everything belongs to a project.
+
+Nothing exists independently.
+
+A project owns:
+
+Chats
+
+Tasks
+
+Files
+
+Memories
+
+Settings
+
+Timeline
+
+Future browser sessions
+
+Future automations
+
+Future agents
+
+Deleting a project archives or removes all associated data according to user choice.
+
+---
+
+# Chat Logic
+
+Conversation is persistent.
+
+Each message stores:
+
+Role
+
+Timestamp
+
+Project ID
+
+Chat ID
+
+Latency
+
+Token usage
+
+Generation status
+
+Errors (if any)
+
+When a response completes:
+
+* Update the chat title if it is still generic.
+* Generate or refresh a short conversation summary.
+* Refresh the project's "last active" timestamp.
+
+---
+
+# AI Request Logic
+
+The AI service is provider-agnostic.
+
+Although the MVP only uses Gemini, all AI calls go through a single interface.
+
+```text
+Chat Request
+      ↓
+AI Manager
+      ↓
+Gemini Provider
+      ↓
+Gemini API
+      ↓
+Stream
+      ↓
+Response
+```
+
+Future providers (Claude, ChatGPT, local models) should implement the same interface so the rest of the application never changes.
+
+---
+
+# Prompt Construction
+
+Each request is built from layers:
+
+Layer 1: System prompt
+
+Layer 2: Application rules
+
+Layer 3: User preferences
+
+Layer 4: Project summary
+
+Layer 5: Recent messages
+
+Layer 6: Current request
+
+The AI Manager assembles these layers before sending the request.
+
+---
+
+# Streaming Logic
+
+The backend streams tokens as they arrive.
+
+Workflow:
+
+Create empty assistant message
+
+↓
+
+Receive chunk
+
+↓
+
+Append chunk
+
+↓
+
+Send via WebSocket
+
+↓
+
+Frontend renders immediately
+
+↓
+
+Repeat until complete
+
+↓
+
+Persist final response
+
+If the stream fails, preserve the partial output and mark the message as interrupted.
+
+---
+
+# Memory Logic
+
+The MVP uses structured memory rather than semantic/vector search.
+
+Memory types:
+
+* User preference
+* Project summary
+* Pinned note
+* Conversation summary
+* Manual note
+
+The AI Manager queries relevant memory before prompt construction.
+
+---
+
+# Task Logic
+
+Every meaningful AI action creates or updates a task.
+
+Example:
+
+User: "Design homepage"
+
+Task created:
+
+Status: Running
+
+↓
+
+Gemini responds
+
+↓
+
+Task marked Complete
+
+↓
+
+Timeline updated
+
+Simple conversational requests do not require standalone tasks unless the user explicitly requests them or they produce lasting project work.
+
+---
+
+# File Logic
+
+Files belong to projects.
+
+Uploading a file:
+
+Validate
+
+↓
+
+Virus/size/type checks (where applicable)
+
+↓
+
+Store
+
+↓
+
+Generate metadata
+
+↓
+
+Link to project
+
+↓
+
+Make available to future AI requests
+
+The MVP stores metadata; deeper indexing and content extraction can be added later.
+
+---
+
+# Dashboard Logic
+
+Dashboard never performs calculations directly.
+
+Instead, it requests aggregated data from backend services:
+
+Recent projects
+
+Recent chats
+
+Task counts
+
+API usage
+
+Storage
+
+Notifications
+
+System status
+
+The backend returns a precomputed view model optimized for rendering.
+
+---
+
+# Search Logic
+
+Global search queries:
+
+Projects
+
+Chats
+
+Messages
+
+Tasks
+
+Files
+
+Memories
+
+Search results are grouped by category and ranked by relevance.
+
+---
+
+# Settings Logic
+
+Settings are loaded during application startup.
+
+Changing settings triggers:
+
+Validation
+
+↓
+
+Persistence
+
+↓
+
+Event publication
+
+↓
+
+Interested services refresh configuration
+
+Example:
+
+Changing the default Gemini model updates the AI Manager immediately without restarting the app.
+
+---
+
+# Notification Logic
+
+Notifications are generated by events.
+
+Examples:
+
+Task completed
+
+Upload finished
+
+Gemini unavailable
+
+Project created
+
+Settings updated
+
+Notifications can be transient (toast) or persistent (notification center).
+
+---
+
+# Error Handling Logic
+
+Every service returns structured errors.
+
+Errors include:
+
+Code
+
+Message
+
+Details
+
+Timestamp
+
+Correlation ID
+
+Recoverable errors (timeouts, temporary API failures) should be retried with exponential backoff.
+
+---
+
+# Logging Logic
+
+Every major action is logged.
+
+Log categories:
+
+Authentication
+
+Projects
+
+Chats
+
+Messages
+
+AI requests
+
+Uploads
+
+Settings
+
+Errors
+
+Performance
+
+Logs are timestamped and searchable.
+
+---
+
+# Startup Logic
+
+On application launch:
+
+1. Load configuration.
+2. Connect to the database.
+3. Initialize services.
+4. Verify Gemini configuration.
+5. Load user settings.
+6. Build dashboard state.
+7. Open WebSocket connections.
+8. Present the UI.
+
+If Gemini is unavailable, the application still loads and informs the user that AI features are offline.
+
+---
+
+# Shutdown Logic
+
+On graceful shutdown:
+
+* Finish active database writes.
+* Close WebSocket connections.
+* Flush logs.
+* Release resources cleanly.
+
+---
+
+# Future Evolution (Post-MVP)
+
+The architecture is intentionally modular so future capabilities fit into the same flow rather than creating parallel systems.
+
+Future additions include:
+
+* Multi-agent orchestration
+* Browser automation
+* MCP tool execution
+* Voice pipeline
+* Workflow engine
+* Semantic/vector memory
+* Background task workers
+* External integrations (GitHub, Google Drive, Calendar, email)
+* Multiple AI providers with intelligent routing
+
+These should integrate with the existing event-driven architecture rather than bypass it.
+
+---
+
+# Guiding Engineering Principles
+
+1. **Single Responsibility:** Each service owns one domain.
+2. **Loose Coupling:** Services communicate through interfaces/events, not direct dependencies.
+3. **Provider Abstraction:** The rest of the app should not know which AI model is being used.
+4. **Project-Centric Data:** Almost everything belongs to a project.
+5. **Event-Driven Updates:** UI reacts to events rather than polling.
+6. **Persistent State:** User work is never lost unnecessarily.
+7. **Extensibility First:** Design today's code so tomorrow's features plug in with minimal refactoring.
+8. **Graceful Failure:** If one subsystem fails (for example, Gemini), the rest of the application should continue functioning wherever possible.
+9. **Backend Owns Intelligence:** The frontend is a presentation layer; orchestration and decision-making belong in the backend.
+10. **Observability:** Every important action should be measurable, logged, and traceable to simplify debugging and future optimization.
+
+The end result should be an application whose architecture can grow from a personal AI workspace into a full AI operating system without requiring a fundamental redesign of its core logic.

@@ -1,0 +1,2151 @@
+/**
+ * StreamingMessage — debounced edit-in-place with code-fence awareness.
+ */
+
+// discord.js is CJS — use default import to avoid ESM named-export errors
+import discordPkg from 'discord.js';
+const { ActionRowBuilder, AttachmentBuilder, ButtonBuilder, ButtonStyle, MessageFlags,
+  ContainerBuilder, TextDisplayBuilder, SeparatorBuilder,
+  SectionBuilder, ThumbnailBuilder, MediaGalleryBuilder, MediaGalleryItemBuilder } = discordPkg;
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { log } from './claude-runner.js';
+import { t } from './i18n.js';
+import { formatForDiscord } from './format-pipeline.js';
+import { pickVariant, recordOutcome } from './ab-experiment.js';
+
+// ---------------------------------------------------------------------------
+// 이미지 캐시 — SHA-256 해시 키, max 30건 (의존성 없는 간단한 Map LRU)
+// TABLE_DATA / CHART_DATA 동일 데이터 반복 요청 시 렌더링 스킵
+// Updated: 2026-03-21 13:52 - Force reload by adding timestamp
+// ---------------------------------------------------------------------------
+const _IMAGE_CACHE_MAX = 30;
+const _imageCache = new Map();
+function _imageCacheGet(key) { return _imageCache.get(key); }
+function _imageCacheSet(key, val) {
+  if (_imageCache.size >= _IMAGE_CACHE_MAX) {
+    _imageCache.delete(_imageCache.keys().next().value); // oldest evict
+  }
+  _imageCache.set(key, val);
+}
+function _cacheKey(data) {
+  return createHash('sha256').update(JSON.stringify(data)).digest('hex').slice(0, 16);
+}
+
+// ---------------------------------------------------------------------------
+// lastQueryStore — sessionKey → 마지막 사용자 쿼리 (재생성/요약 버튼용)
+// handlers.js에서 import해서 set, commands.js에서 regen 시 get
+// ---------------------------------------------------------------------------
+import { BoundedMap } from './bounded-map.js';
+import { recordSilentError } from './error-ledger.js';
+export const lastQueryStore = new BoundedMap(1000, 30 * 60_000); // 1000 items, 30min TTL
+
+// ---------------------------------------------------------------------------
+// chartjs-node-canvas 싱글톤 — CHART_DATA 렌더링 (Chrome 없이 순수 Node.js)
+// ---------------------------------------------------------------------------
+const _cjsRequire = createRequire(import.meta.url);
+let _chartNodeCanvas = null;
+function _getChartNodeCanvas() {
+  if (!_chartNodeCanvas) {
+    const { ChartJSNodeCanvas } = _cjsRequire('chartjs-node-canvas');
+    _chartNodeCanvas = new ChartJSNodeCanvas({
+      width: 780, height: 430,
+      backgroundColour: '#313338',
+    });
+    log('info', 'ChartJSNodeCanvas renderer initialized (singleton)');
+  }
+  return _chartNodeCanvas;
+}
+
+// ---------------------------------------------------------------------------
+// Chrome 싱글톤 — TABLE_DATA 렌더링용. 매 요청마다 launch/close 하지 않고 재사용.
+// 페이지(page)는 요청마다 생성/닫기 (메모리 누수 방지)
+// ---------------------------------------------------------------------------
+const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+let _chromeBrowser = null;
+
+// Chrome orphan 방지: 프로세스 종료 시 브라우저 정리
+process.on('exit', () => {
+  if (_chromeBrowser) { try { _chromeBrowser.process()?.kill(); } catch {} }
+});
+process.on('SIGTERM', () => {
+  if (_chromeBrowser) { try { _chromeBrowser.process()?.kill(); } catch {} }
+  process.exit(0);
+});
+
+async function _getChromeBrowser() {
+  if (_chromeBrowser) {
+    try {
+      await _chromeBrowser.pages(); // 살아있는지 probe
+      return _chromeBrowser;
+    } catch {
+      _chromeBrowser = null; // 죽어있으면 재시작
+    }
+  }
+  const { default: puppeteer } = await import('puppeteer-core');
+  _chromeBrowser = await puppeteer.launch({
+    executablePath: CHROME_PATH,
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
+  log('info', 'Chrome browser instance started (singleton)');
+  return _chromeBrowser;
+}
+
+/**
+ * PID, 절대 파일경로 등 기술 내부 정보를 사용자 친화적 표현으로 마스킹.
+ * 코드 펜스 내부는 건드리지 않음.
+ */
+function maskTechDetails(text) {
+  if (!text) return text;
+  const lines = text.split('\n');
+  const result = [];
+  let inFence = false;
+  for (const line of lines) {
+    if (line.trimStart().startsWith('```')) { inFence = !inFence; result.push(line); continue; }
+    if (inFence) { result.push(line); continue; }
+    let masked = line
+      // PID 숫자 (예: "PID 1234", "pid=5678")
+      .replace(/\b(PID|pid)[=\s]+\d{2,6}\b/g, '(내부 프로세스)')
+      // 절대 홈 경로 (예: /Users/username/.jarvis/..., ~/jarvis/runtime/...) gitleaks:allow
+      .replace(/\/Users\/[^/\s]+\/\.jarvis\/[^\s,)'"]+/g, '(Jarvis 내부 경로)') // gitleaks:allow
+      .replace(/~\/\.jarvis\/[^\s,)'"]+/g, '(Jarvis 내부 경로)') // gitleaks:allow
+      // 절대 홈 경로 일반 (예: /Users/username/...)  gitleaks:allow
+      .replace(/\/Users\/[^/\s]+\/(?!\.jarvis)[^\s,)'"]{8,}/g, '(내부 경로)'); // gitleaks:allow
+    result.push(masked);
+  }
+  return result.join('\n');
+}
+
+/**
+ * Markdown 테이블을 Discord 모바일에서 읽기 좋은 불릿 리스트로 변환.
+ * | 헤더1 | 헤더2 | 형식 → - **헤더1** · 값1 / **헤더2** · 값2
+ */
+function convertTablesToList(text) {
+  if (!text.includes('|')) return text;
+
+  const lines = text.split('\n');
+  const result = [];
+  let i = 0;
+  let inFence = false;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    // 코드 펜스 추적 — 펜스 내부 파이프는 테이블로 처리하지 않음
+    if (line.trimStart().startsWith('```')) {
+      inFence = !inFence;
+      result.push(line);
+      i++;
+      continue;
+    }
+    if (inFence) {
+      result.push(line);
+      i++;
+      continue;
+    }
+    // 테이블 헤더 행 감지: 파이프로 시작하거나 파이프 2개 이상 포함
+    if (/\|.+\|/.test(line)) {
+      // 헤더 파싱
+      const headers = line.split('|').map(h => h.trim()).filter(Boolean);
+      const headerLineIdx = i;
+      i++;
+      // 구분선(---|---) 건너뛰기
+      if (i < lines.length && /^\s*\|?[\s\-:|]+\|/.test(lines[i])) {
+        i++;
+      }
+      // 데이터 행 처리
+      let dataRowCount = 0;
+      while (i < lines.length && /\|.+\|/.test(lines[i])) {
+        const cells = lines[i].split('|').map(c => c.trim()).filter(Boolean);
+        if (cells.length > 0) {
+          if (headers.length >= 2 && cells.length >= 2) {
+            // 헤더-값 쌍으로 출력
+            const parts = headers.map((h, idx) => {
+              const val = cells[idx] ?? '';
+              return val ? `**${h}** · ${val}` : null;
+            }).filter(Boolean);
+            result.push(`- ${parts.join(' / ')}`);
+          } else {
+            // 단일 컬럼 or 헤더 없는 경우
+            result.push(`- ${cells.join(' · ')}`);
+          }
+          dataRowCount++;
+        }
+        i++;
+      }
+      // 스트리밍 부분 수신: 헤더만 있고 데이터 행이 없으면 원본 헤더 행 보존
+      if (dataRowCount === 0) {
+        result.push(lines[headerLineIdx]);
+      }
+    } else {
+      result.push(line);
+      i++;
+    }
+  }
+
+  return result.join('\n');
+}
+
+// Active placeholder tracking — persisted for orphan cleanup on restart
+const PLACEHOLDER_STATE = join(process.env.BOT_HOME || join(homedir(), 'jarvis/runtime'), 'state', 'active-placeholders.json');
+
+function _loadPlaceholders() {
+  try { return JSON.parse(readFileSync(PLACEHOLDER_STATE, 'utf-8')); } catch { return []; }
+}
+function _savePlaceholders(list) {
+  const tmp = PLACEHOLDER_STATE + '.tmp';
+  try { writeFileSync(tmp, JSON.stringify(list)); renameSync(tmp, PLACEHOLDER_STATE); } catch { /* best effort */ }
+}
+function _registerPlaceholder(channelId, messageId) {
+  const list = _loadPlaceholders();
+  list.push({ channelId, messageId, ts: Date.now() });
+  _savePlaceholders(list);
+}
+function _unregisterPlaceholder(messageId) {
+  const list = _loadPlaceholders().filter(p => p.messageId !== messageId);
+  _savePlaceholders(list);
+}
+export { _loadPlaceholders, _savePlaceholders };
+
+/**
+ * On bot startup: delete Discord messages that were left as orphan placeholders
+ * (i.e. bot crashed mid-response). Removes entries older than 1 hour.
+ * Call this once after the Discord client is ready.
+ *
+ * @param {import('discord.js').Client} client - The logged-in Discord client.
+ */
+export async function cleanupOrphanPlaceholders(client) {
+  const list = _loadPlaceholders();
+  if (!list.length) return;
+
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const now = Date.now();
+  const survivors = [];
+
+  for (const entry of list) {
+    const { channelId, messageId, ts: sentAt } = entry;
+    // Keep entries younger than 1 hour — they may still be active
+    if (now - sentAt < ONE_HOUR_MS) {
+      survivors.push(entry);
+      continue;
+    }
+    try {
+      const channel = await client.channels.fetch(channelId);
+      if (channel) {
+        const message = await channel.messages.fetch(messageId);
+        // 버튼(components) + 커서(▌) 제거만 — 메시지 내용은 유지 (삭제 금지)
+        const cleaned = (message.content || '').replace(/ ▌$/, '');
+        await message.edit({ content: cleaned || '...', components: [], embeds: [] });
+        log('info', 'cleanupOrphanPlaceholders: removed stale components from message', { channelId, messageId });
+      }
+    } catch (err) {
+      // Message already deleted or channel inaccessible — treat as cleaned up
+      log('debug', 'cleanupOrphanPlaceholders: could not clean (already gone?)', {
+        channelId, messageId, error: err.message,
+      });
+    }
+    // Either deleted or already gone — do not keep in survivors
+  }
+
+  _savePlaceholders(survivors);
+}
+
+// 700ms — Discord edit rate limit(~초당 1회) 내에서 체감 "타이핑" 수준.
+// 2000ms 였을 때 블록 단위로 뚝뚝 떨어지는 느낌 → 대화형 경험 해침.
+// 2026-04-19: 고정 700ms → adaptiveInterval() 가변 throttle 도입. 짧은 응답 체감 속도 2배.
+const STREAM_EDIT_INTERVAL_MS = 700; // DEPRECATED: fallback 기본값. 실제는 adaptiveInterval() 사용.
+
+/**
+ * Discord edit 간격을 버퍼 특성에 맞춰 조정.
+ *   - 짧은 응답(≤120자): 300ms  — 즉각적인 체감 응답
+ *   - 일반 응답: 400ms             — 부드러운 타이핑
+ *   - 긴 응답(>800자): 550ms       — rate-limit 부담 완화
+ *   - 코드 블록 열림: 600ms         — fence 안전 마진
+ *   - tool status 갱신 직후: 450ms  — 상태 라인 빠른 반영
+ */
+function adaptiveInterval({ bufferLen = 0, inFence = false, hasTool = false } = {}) {
+  if (inFence) return 600;
+  if (hasTool) return 450;
+  if (bufferLen < 120) return 300;
+  if (bufferLen > 800) return 550;
+  return 400;
+}
+
+// 2026-04-20 재조정: 1700 → 1900 원복
+// 1700은 문단 경계 탐색 여유 확보 명분이었으나 실제로는 1600자대 답변까지
+// 분할 발동 → orphan cleanup race 노출 증가. 원래 1990 직전까지 단일 메시지 유지가 정상.
+// [2026-04-26 RC-1 구조 수정] _sendOrEdit의 CONTENT_SAFE_LIMIT(1700)과 동기화.
+// 호출자(_flushInner)가 단일 chunk를 1700자 이하로 잘라 _sendOrEdit에 전달하면
+// _sendOrEdit 내부 split 경로(buffer 침범)는 발동되지 않음 — 책임 경계 명확화.
+const STREAM_MAX_CHARS = 1200; // [DUP-FIX v5 2026-04-26] 1400→1200. v4 운영 실측: 1400자 → formatForDiscord 변환 후 1744자(+344자) → split 재발동. 마진 800자로 확대.
+const CODE_FILE_MIN_LINES = 30;
+const LANG_EXT = {
+  javascript: 'js', typescript: 'ts', python: 'py', py: 'py',
+  bash: 'sh', shell: 'sh', sh: 'sh', zsh: 'sh',
+  json: 'json', yaml: 'yml', yml: 'yml',
+  html: 'html', css: 'css', sql: 'sql',
+  rust: 'rs', go: 'go', java: 'java',
+  cpp: 'cpp', c: 'c', ruby: 'rb',
+};
+
+// ---------------------------------------------------------------------------
+// 텍스트 청크 분할 — Discord TextDisplay 4000자 메시지 합산 제한 대응.
+// 우선순위: 헤딩(###) → 구분선(---) → 단락(\n\n) → 줄(\n) → 단어 순.
+// 문단 중간 끊김 최소화로 가독성 확보 (2026-04-20 오너 요청 반영).
+// maxLen 기본 3800 (Discord 4000 제한의 95% — 안전 마진).
+// ---------------------------------------------------------------------------
+function _splitIntoChunks(text, maxLen = 3800) {
+  if (text.length <= maxLen) return [text];
+  const chunks = [];
+  let remaining = text;
+  // 가드 #7 (2026-04-29): 이전 chunk가 열린 코드블록으로 끝났으면 다음 chunk 시작에 자동 열기.
+  // 빈 문자열 = 닫힌 상태. 비어있지 않으면 lang 또는 빈 fence(' ' sentinel) 보존.
+  let openFenceLang = '';
+
+  while (remaining.length > maxLen) {
+    let splitAt = maxLen;
+    const headSlice = remaining.slice(0, maxLen);
+
+    // 1차: ### 헤딩 경계 — 섹션 단위 분할 (40% 이상 위치)
+    //      `\n### ` 또는 `\n## ` 패턴의 마지막 위치
+    let headingIdx = -1;
+    const headingRe = /\n(?=#{2,3} )/g;
+    let m;
+    while ((m = headingRe.exec(headSlice)) !== null) headingIdx = m.index;
+
+    // 2차: --- 구분선
+    const hrIdx = headSlice.lastIndexOf('\n---');
+
+    // 3차: 단락 경계 (\n\n)
+    const paraIdx = headSlice.lastIndexOf('\n\n');
+
+    // 우선순위 적용 — 40%를 기준점으로 (너무 앞쪽 분할 방지)
+    if (headingIdx > maxLen * 0.4) {
+      splitAt = headingIdx + 1;
+    } else if (hrIdx > maxLen * 0.4) {
+      splitAt = hrIdx + 1;
+    } else if (paraIdx > maxLen * 0.4) {
+      splitAt = paraIdx + 2;
+    } else {
+      // 4차: 줄 경계 (\n) — 50% 이상
+      const lineIdx = headSlice.lastIndexOf('\n');
+      if (lineIdx > maxLen * 0.5) {
+        splitAt = lineIdx + 1;
+      } else {
+        // 5차: 단어 경계 (공백) — 60% 이상
+        const wordIdx = headSlice.lastIndexOf(' ');
+        if (wordIdx > maxLen * 0.6) splitAt = wordIdx + 1;
+        // else: 강제 분할 (maxLen 그대로)
+      }
+    }
+    let chunk = remaining.slice(0, splitAt).trimEnd();
+    let nextRemaining = remaining.slice(splitAt).trimStart();
+
+    // 가드 #7: 이전 chunk가 fence open으로 끝났으면 이 chunk 시작에 자동 열기
+    // (mermaid·json·기타 코드블록 본문이 chunk 경계에 걸리는 사고 방지)
+    if (openFenceLang) {
+      const langTag = openFenceLang === ' ' ? '' : openFenceLang;
+      chunk = '```' + langTag + '\n' + chunk;
+    }
+
+    // 가드 #7: 이 chunk 끝의 fence 카운트 홀수 → 자동 닫기 + 다음 chunk 열기 정보 보존
+    const fences = (chunk.match(/```/g) || []).length;
+    if (fences % 2 === 1) {
+      // 마지막 열린 fence의 언어 추출
+      let lang = '';
+      for (const fm of chunk.matchAll(/```(\w*)/g)) lang = fm[1] || '';
+      chunk += '\n```';
+      openFenceLang = lang || ' '; // 빈 fence는 ' ' sentinel
+    } else {
+      openFenceLang = '';
+    }
+
+    chunks.push(chunk);
+    remaining = nextRemaining;
+  }
+  // 마지막 잔여 — 이전 chunk가 fence open이면 이 chunk 시작에 자동 열기
+  if (remaining.length > 0) {
+    let last = remaining;
+    if (openFenceLang) {
+      const langTag = openFenceLang === ' ' ? '' : openFenceLang;
+      last = '```' + langTag + '\n' + last;
+    }
+    chunks.push(last);
+  }
+  return chunks;
+}
+
+// ---------------------------------------------------------------------------
+// CV2 전송 전 마크다운 헤딩을 굵은 텍스트 시각 구조로 변환.
+// Discord TextDisplay는 ## 헤딩을 렌더링하지 않으므로 볼드 텍스트로 대체.
+// ---------------------------------------------------------------------------
+function _preprocessMarkdown(text) {
+  // 2026-05-14: ##/### 헤더는 Discord 네이티브 마크다운으로 보존.
+  // 기존 볼드 변환(## → **── X ──**, ### → **▸ X**)은 Discord가 헤더를 미지원하던 시절 레거시.
+  // Discord는 2023년부터 # ## ### 공식 지원. 네이티브 헤더가 시각적으로 훨씬 낫다.
+  // #### 이하는 Discord 미지원이므로 볼드로 대체.
+  return text
+    .replace(/^#### (.+)$/mg, '**$1**')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+export class StreamingMessage {
+  constructor(channel, replyTo = null, sessionKey = null, channelId = null) {
+    this.channel = channel;
+    this.replyTo = replyTo;
+    this.sessionKey = sessionKey;
+    this.channelId = channelId;
+    this.buffer = '';
+    this.currentMessage = null;
+    this.sentLength = 0;
+    this.timer = null;
+    this.fenceOpen = false;
+    this.finalized = false;
+    this.hasRealContent = false;  // buffer에 텍스트가 있음 (finalize 판단용)
+    this._textSent = false;       // Discord에 실제 텍스트 전송됨 (embed 업데이트 중단 기준)
+    this._customPhase = false;    // updatePhase 호출됨 — progressTick 덮어쓰기 방지
+    this._markerCardSent = false; // CV2/CHART/TABLE 카드가 이미 전송됨 → _wrapInCV2 버튼 생략
+    this._statusLines = [];
+    this._statusTimer = null;
+    this._thinkingMsg = t('stream.thinking');
+    this._initialThinkingMsg = t('stream.thinking');
+    this._placeholderSentAt = 0;
+    this._progressTimer = null;
+    this._toolCount = 0;
+    this._isPlaceholder = false;
+    this._flushing = false;
+    this._flushDone = null;   // Promise | null — 진행 중인 flush 완료 신호
+    this._finalizeComplete = false; // 진정한 멱등성: 두 번째 finalize() 호출 방지
+    // family 채널 등 quiet 채널: tool 상태 표시 생략
+    const quietIds = (process.env.QUIET_CHANNEL_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+    this._isQuiet = channelId ? quietIds.includes(channelId) : false;
+    // ----- P0-1: tool status / thinking prefix (본문 스트리밍 중에도 표시) -----
+    this._toolStatusLine = '';      // 현재 진행 중인 도구(한 줄)
+    this._thinkingActive = false;   // thinking 블록 활성 상태
+    this._lastToolAt = 0;           // 마지막 tool 이벤트 시각 (stale 제거용)
+    this._channelName = null;       // artifact 업로드 시 태그로 사용
+    // ----- P2-1: 상시 Status bar (모델·경과·턴·토큰) -----
+    this._statusMeta = null;        // { model, startedAt, turn, tokens } 또는 null (비활성)
+    // ----- P2-3: Stream resumption (edit 실패 연속 발생 시 새 메시지로 이어붙이기) -----
+    this._editFailureStreak = 0;    // edit 연속 실패 카운터
+    this._resumedCount = 0;         // 이어붙인 횟수 (메시지 분할)
+    // ----- P3-1: 마커 조기 전송 (CHART_DATA_EARLY_SEND=1 opt-in) -----
+    this._markerEarlySent = new Set(); // 조기 전송 완료된 마커 이름 (예: 'CHART_DATA')
+    // [MARKER-ISOLATION 2026-07-13] 긴 응답 분할 시 격리된 마커 원문(TABLE_DATA 등). finalize에서 처리 후 리셋.
+    this._deferredMarkerTail = '';
+    this._inMarkerTail = false;   // 마커 구간 진입 후 후속 텍스트를 모두 tail로 보내는 래치
+    // ----- P3-3: A/B 실험 — throttle-v1 variant ('adaptive'|'fixed-700') -----
+    this._userId = null;              // handlers.js가 setUserId()로 주입
+    this._throttleVariant = null;     // pickVariant 결과 캐싱 (null = 미결정 → 기본 adaptive)
+    this._startedAtMs = Date.now();   // recordOutcome용 elapsed 기산점
+    this._editCount = 0;              // recordOutcome용 edit 횟수
+    this._experimentRecorded = false; // finalize 중복 기록 방지
+  }
+
+  /**
+   * P3-3: userId 설정 — A/B 실험 variant 결정에 사용.
+   * 사용자 단위 deterministic 분산 (같은 userId는 항상 같은 variant).
+   */
+  setUserId(userId) {
+    this._userId = userId || null;
+    if (this._userId) {
+      try {
+        this._throttleVariant = pickVariant('throttle-v1', this._userId, {
+          channelName: this._channelName,
+        });
+      } catch { this._throttleVariant = null; }
+    }
+  }
+
+  /** 채널 이름 설정 — handlers.js에서 페르소나 로드 후 주입. artifact 태그에 사용. */
+  setChannelName(name) { this._channelName = name || null; }
+
+  /**
+   * P0-1: 도구 실행 상태 표시.
+   * placeholder 모드면 기존 updateStatus() 경로, 텍스트 스트리밍 중이면 prefix 라인으로 표시.
+   */
+  setToolStatus(line) {
+    if (this._isQuiet) return;
+    this._toolStatusLine = line || '';
+    this._lastToolAt = Date.now();
+    if (this._textSent) {
+      // 본문 스트리밍 중 — 다음 flush에 prefix 반영
+      this._scheduleFlush();
+    } else {
+      // placeholder 모드 — 기존 경로 (line ×N 카운팅 포함)
+      this.updateStatus(line);
+    }
+  }
+
+  /** tool 블록 종료 시 호출 — prefix 제거. 300ms debounce로 잔상 방지. */
+  clearToolStatus() {
+    if (!this._toolStatusLine) return;
+    this._toolStatusLine = '';
+    if (this._textSent) this._scheduleFlush();
+  }
+
+  /** P0-1: thinking 블록 감지. 본문 스트리밍 중 "🧠 생각 정리 중" prefix. */
+  setThinking(on) {
+    if (this._isQuiet) return;
+    const next = !!on;
+    if (this._thinkingActive === next) return;
+    this._thinkingActive = next;
+    if (this._textSent) this._scheduleFlush();
+  }
+
+  /**
+   * P2-1: 상시 Status bar 메타 갱신.
+   * 처음 호출 시 활성화 (startedAt 기록), 이후 patch 방식으로 누적.
+   * 호출 예:
+   *   setStatusMeta({ model: 'Opus 4.7', startedAt: Date.now() })
+   *   setStatusMeta({ turn: prev+1 })
+   *   setStatusMeta({ tokens: 8234 })
+   */
+  setStatusMeta(patch) {
+    if (this._isQuiet) return;
+    if (!patch || typeof patch !== 'object') return;
+    if (!this._statusMeta) this._statusMeta = {};
+    Object.assign(this._statusMeta, patch);
+    if (this._textSent) this._scheduleFlush();
+  }
+
+  /** 턴 카운터 편의 메서드 — setStatusMeta({ turn: ++ }) 대용 */
+  incTurn() {
+    if (this._isQuiet) return;
+    if (!this._statusMeta) this._statusMeta = { turn: 0 };
+    this._statusMeta.turn = (this._statusMeta.turn || 0) + 1;
+    if (this._textSent) this._scheduleFlush();
+  }
+
+  /** 상태 바 문자열 렌더 (없으면 빈 문자열)
+   *
+   * isFinal=true 시에는 빈 문자열 반환 — 최종 메시지에는 handlers.js 가
+   * `streamer.append('\n' + statsLine)` 으로 붙이는 completion stats line
+   * (`🤖 Opus · ⏱️ Ns · 💭 K↑ K↓ · 🛠️ N · 📊 N%`) 만 남도록.
+   * (과거엔 여기서도 `✅ 🤖 ... · 📊 N턴 · 🎫 N` 을 붙였으나 정보 중복 + 아래 푸터
+   * 2개가 겹치는 버그가 있어 최종 시점에는 숨김.)
+   */
+  _renderStatusBar(isFinal) {
+    // finalize() 진입 시점부터는 절대 statusBar 붙이지 않음 (append→_flush race 방지).
+    // handlers.js가 completion stats line(`🤖 Opus · 📊 N%`)을 append한 뒤 finalize를
+    // 호출하므로, 그 사이에 일어나는 _flush의 _sendOrEdit도 this.finalized=true를 보고 스킵.
+    if (isFinal || this.finalized) return '';
+    const m = this._statusMeta;
+    if (!m) return '';
+    const parts = [];
+    if (m.model) parts.push(`🤖 ${m.model}`);
+    if (m.startedAt) {
+      const elapsed = Math.max(0, Math.round((Date.now() - m.startedAt) / 1000));
+      parts.push(`⏱️ ${elapsed}s`);
+    }
+    if (m.turn) parts.push(`📊 ${m.turn}턴`);
+    if (m.tokens) {
+      const t = m.tokens >= 1000
+        ? `${(m.tokens / 1000).toFixed(1)}k`
+        : String(m.tokens);
+      parts.push(`🎫 ${t}`);
+    }
+    if (parts.length === 0) return '';
+    return `-# ⏳ ${parts.join(' · ')}`;
+  }
+
+  /**
+   * P0-1: 본문 + status prefix 합성.
+   * - 🧠 thinking 활성 → 상단 1줄
+   * - 🔧 tool 상태(15초 이내) → 상단 소형 라인 (-# prefix)
+   * - isFinal=false면 커서(▌) 부착
+   */
+  _composeDisplay(content, isFinal) {
+    const prefixes = [];
+    if (this._thinkingActive && !this.finalized && !isFinal) {
+      prefixes.push('🧠 *생각 정리 중…*');
+    }
+    if (this._toolStatusLine && (Date.now() - this._lastToolAt) < 15000 && !this.finalized && !isFinal) {
+      // -# prefix는 Discord small text — 본문을 방해하지 않음
+      prefixes.push(`-# ${this._toolStatusLine}`);
+    }
+    const cursor = (!this.finalized && !isFinal) ? ' ▌' : '';
+    // P2-1: 상시 Status bar (모델·경과·턴·토큰) — 본문 하단 메타 라인
+    const statusBar = this._renderStatusBar(isFinal);
+    const head = prefixes.length > 0
+      ? `${prefixes.join('\n')}\n\n${content}${cursor}`
+      : `${content}${cursor}`;
+    return statusBar ? `${head}\n\n${statusBar}` : head;
+  }
+
+  /** Build the Stop button row (null if no sessionKey) */
+  _stopRow() {
+    if (!this.sessionKey) return null;
+    return new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`cancel_${this.sessionKey}`)
+        .setLabel(t('stream.stop'))
+        .setStyle(ButtonStyle.Danger)
+    );
+  }
+
+  /**
+   * P1-2: 종료 시 표시되는 최종 액션 행 — 재생성 / 요약 / 다운로드
+   * 3개 섹션(마커 이미지, CV2, 일반 텍스트) 모두 동일 행 사용 (DRY).
+   * sessionKey 없으면 null.
+   */
+  _finalActionRow() {
+    if (!this.sessionKey) return null;
+    return new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`regen_${this.sessionKey}`)
+        .setLabel('🔄 재생성')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`summarize_${this.sessionKey}`)
+        .setLabel('📝 요약')
+        .setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder()
+        .setCustomId(`download_${this.sessionKey}`)
+        .setLabel('💾 다운로드')
+        .setStyle(ButtonStyle.Secondary),
+    );
+  }
+
+  /** Set context-aware initial thinking message (call before sendPlaceholder). */
+  setContext(msg) {
+    this._thinkingMsg = msg;
+    this._initialThinkingMsg = msg;
+  }
+
+  /** Send a plain-text placeholder with Stop button and start progress timer. */
+  async sendPlaceholder() {
+    if (this.currentMessage) return;
+    this._placeholderSentAt = Date.now();
+    const row = this._stopRow();
+    const payload = {
+      content: this._thinkingMsg,
+      embeds: [],
+      components: row ? [row] : [],
+      flags: MessageFlags.SuppressEmbeds,
+    };
+    try {
+      if (this.replyTo) {
+        this.currentMessage = await this.replyTo.reply(payload);
+        this.replyTo = null;
+      } else {
+        this.currentMessage = await this.channel.send(payload);
+      }
+      this._isPlaceholder = true;
+      _registerPlaceholder(this.channel.id, this.currentMessage.id);
+      this._progressTimer = setInterval(() => this._progressTick(), 5000);
+    } catch (err) {
+      log('error', 'Placeholder send failed', { error: err.message });
+    }
+  }
+
+  /** Check elapsed time and update thinking message progressively. */
+  _progressTick() {
+    if (this._textSent || this.finalized) {
+      clearInterval(this._progressTimer);
+      this._progressTimer = null;
+      return;
+    }
+    // updatePhase로 커스텀 메시지가 설정된 경우 덮어쓰지 않음
+    if (this._customPhase) return;
+    const elapsed = Date.now() - this._placeholderSentAt;
+    const newMsg = this._getProgressMessage(elapsed);
+    if (newMsg !== this._thinkingMsg) {
+      this._thinkingMsg = newMsg;
+      this._flushStatus();
+    }
+  }
+
+  _getProgressMessage(elapsedMs) {
+    const s = elapsedMs / 1000;
+    if (s >= 60) return t('stream.thinking.almostDone');
+    if (s >= 30) return t('stream.thinking.deep');
+    if (s >= 15) return t('stream.thinking.complex');
+    if (s >= 8) return t('stream.thinking.careful');
+    return this._initialThinkingMsg;
+  }
+
+  /** Update placeholder with a tool status line (before streaming starts). */
+  updateStatus(line) {
+    if (this._isQuiet || this._textSent || this.finalized || !this.currentMessage) return;
+    this._toolCount++;
+    // 마지막 줄과 동일하면 카운터로 합침 (예: "🔍 검색 중 ×3")
+    if (this._statusLines.length > 0) {
+      const last = this._statusLines[this._statusLines.length - 1];
+      const baseMatch = last.match(/^(.*?)(?:\s×\d+)?$/);
+      const base = baseMatch ? baseMatch[1] : last;
+      if (base === line) {
+        const prevCount = last.match(/×(\d+)$/);
+        const count = prevCount ? parseInt(prevCount[1]) + 1 : 2;
+        this._statusLines[this._statusLines.length - 1] = `${line} ×${count}`;
+        // debounce flush만 하고 조기 리턴
+        if (this._statusTimer) clearTimeout(this._statusTimer);
+        this._statusTimer = setTimeout(() => { this._statusTimer = null; this._flushStatus(); }, 800);
+        return;
+      }
+    }
+    this._statusLines.push(line);
+    // Keep only the 3 most recent tool lines to avoid clutter
+    if (this._statusLines.length > 3) {
+      this._statusLines = this._statusLines.slice(-3);
+    }
+    // 타이머를 리셋해서 마지막 상태 반영 (debounce reset 방식)
+    if (this._statusTimer) clearTimeout(this._statusTimer);
+    this._statusTimer = setTimeout(() => {
+      this._statusTimer = null;
+      this._flushStatus();
+    }, 800);
+  }
+
+  // 단계별 progress 메시지 즉시 업데이트 (quiet 채널은 생략)
+  async updatePhase(msg) {
+    if (this._isQuiet || this._textSent || this.finalized) return;
+    log('debug', 'updatePhase', { msg, hasMsg: !!this.currentMessage });
+    this._thinkingMsg = msg;
+    this._customPhase = true;  // progressTick 덮어쓰기 방지
+    await this._flushStatus();
+  }
+
+  async _flushStatus() {
+    if (this._textSent || !this.currentMessage) return;
+    const parts = [this._thinkingMsg];
+    if (this._statusLines.length > 0) {
+      parts.push('', ...this._statusLines);
+    }
+    const row = this._stopRow();
+    try {
+      await this.currentMessage.edit({ content: parts.join('\n'), embeds: [], components: row ? [row] : [] });
+    } catch (err) {
+      log('warn', 'flushStatus edit failed', { error: err.message, code: err.code });
+    }
+  }
+
+  /**
+   * Replace Mode: tool 사용 후 새 텍스트 블록 시작 시 호출.
+   * 이전 중간 텍스트를 버리고 새 텍스트로 교체 준비.
+   * currentMessage는 유지 — 다음 append+flush 시 edit으로 교체됨.
+   */
+  clearForReplace() {
+    this.buffer = '';
+    this.sentLength = 0;
+    this.fenceOpen = false;
+  }
+
+  append(text) {
+    if (this.finalized) return;
+    if (!text || text.length === 0) return;
+    this.hasRealContent = true;
+    this.buffer += text;
+    // 2초마다 Discord edit 발동 (타이핑 효과 스트리밍)
+    this._scheduleFlush();
+    // 버퍼가 Discord 한도 초과 시 즉시 분할 전송
+    if (this.buffer.length >= STREAM_MAX_CHARS) {
+      this._flush();
+    }
+  }
+
+  _trackFences(text) {
+    const matches = text.match(/```/g);
+    if (matches) {
+      for (const _ of matches) {
+        this.fenceOpen = !this.fenceOpen;
+      }
+    }
+  }
+
+  _scheduleFlush() {
+    if (this.timer) return;
+    // P3-3: throttle-v1 A/B — 'fixed-700' variant일 때는 고정 700ms, 아니면 adaptive
+    const interval = this._throttleVariant === 'fixed-700'
+      ? 700
+      : adaptiveInterval({
+          bufferLen: this.buffer.length,
+          inFence: this.fenceOpen,
+          hasTool: !!this._toolStatusLine,
+        });
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this._editCount++; // P3-3: flush = 1 edit 시도 (대략적 지표)
+      this._flush();
+    }, interval);
+  }
+
+  async _flush() {
+    if (this._flushing || this.buffer.length === 0) return;
+    // [2026-06-07] 코딩모드 등 deferStreaming 세션: 생성 중 중간 flush를 막고 버퍼만 모은다.
+    //   finalize 시 _finalizeComplete=true가 되어 가드 해제 → 완성 버퍼를 한 번에 fence-aware 청킹.
+    //   (스트리밍 중간 flush가 코드블록을 쪼개 깨뜨리는 문제를 근본 차단. 완성 버퍼 청킹은 시뮬로 검증됨.)
+    if (this.deferStreaming && !this._finalizeComplete) return;
+    this._flushing = true;
+    let resolve;
+    this._flushDone = new Promise(r => { resolve = r; });
+    try { await this._flushInner(); } finally {
+      this._flushing = false;
+      this._flushDone = null;
+      resolve();
+    }
+  }
+
+  async _flushInner() {
+    // [DUP-DIAG 2026-04-26] 응답 중복 출력 버그 진단 계측
+    // 가설: chunk-per-message 모드 진입 시 cumulative edit으로 송출된 부분이 buffer에 남아 중복 송출
+    log('info', 'DUP-DIAG _flushInner 진입', {
+      bufferLen: this.buffer.length,
+      sentLength: this.sentLength,
+      currentMessageId: this.currentMessage?.id || null,
+      finalized: this.finalized,
+      finalizeComplete: this._finalizeComplete,
+    });
+    // 스트리밍 버퍼 전체에 narration filter 적용 (라인 단위 regex가 전체 텍스트에서 매칭)
+    // _sendOrEdit의 formatForDiscord는 청크 단위라 분할된 내러티브를 못 잡음
+    this.buffer = formatForDiscord(this.buffer, { channelId: this.channelId });
+
+    // P3-1: 마커 조기 전송 (opt-in) — 마커가 완성되자마자 이미지 전송 착수
+    await this._tryEarlyMarkerSend();
+
+    // [MARKER-ISOLATION 2026-07-13] 긴 응답이 여러 메시지로 분할될 때 TABLE_DATA/CHART_DATA 등
+    // 마커가 중간 chunk에 실려 finalize의 _extractAndSendMarkers(마지막 메시지만 조회)가 놓쳐
+    // raw JSON이 사용자에게 노출되던 버그 차단. 마커 시작(^MARKER:{)부터 buffer 끝까지를 본문
+    // 스트리밍에서 격리 → finalize에서 _deferredMarkerTail로 처리. (마커는 응답 최하단 단독 배치 규칙)
+    if (this._inMarkerTail) {
+      // 이미 마커 구간 — 후속 텍스트(마커 JSON의 나머지 조각 포함)를 전부 tail로.
+      this._deferredMarkerTail += this.buffer;
+      this.buffer = '';
+    } else {
+      const _mIdx = this.buffer.search(/^(?:TABLE_DATA|CHART_DATA|EMBED_DATA|CV2_DATA):\s*[{[]/m);
+      if (_mIdx !== -1) {
+        this._inMarkerTail = true;   // 래치 ON — 마커가 여러 flush에 걸쳐 쪼개져도 나머지 조각까지 격리
+        this._deferredMarkerTail += this.buffer.slice(_mIdx);
+        this.buffer = this.buffer.slice(0, _mIdx);
+      }
+    }
+
+    // [2026-04-26 RC-1 구조 수정] 책임 경계 — buffer는 호출자(_flushInner)만 슬라이스.
+    //  계약: _sendOrEdit(content, isFinal)는 단일 chunk(<= STREAM_MAX_CHARS)를 받아
+    //        currentMessage 1개에 edit/send만 하고 sentLength = content.length 마킹만 함.
+    //        _sendOrEdit은 buffer/sentLength 외부 상태 슬라이스 금지.
+    //
+    //  과거 결함: _flushInner가 1900자 chunk를 잘라서 _sendOrEdit에 넘기면, _sendOrEdit
+    //            내부 CONTENT_SAFE_LIMIT(1700) 초과로 또 split → currentMessage 다중
+    //            교체 + sentLength=마지막 part 길이 → _flushInner의 sentLength=0 리셋과
+    //            충돌 → 이후 잔여 buffer edit 시 누적 본문 유실/이중 송출.
+    //  해결: STREAM_MAX_CHARS = CONTENT_SAFE_LIMIT (1700) 동기화 → _sendOrEdit 내부 split 미발동.
+    // [DUP-FIX 2026-04-26 v2] chunk-per-message 진입 직전 — currentMessage에 첫 STREAM_MAX_CHARS
+    //   까지 cumulative edit으로 마무리한 후, 그 다음 chunk부터 새 메시지로 분배.
+    //   결함 메커니즘 (단위 테스트 재현 확인됨):
+    //     cumulative edit으로 sentLength자 송출 후 chunk-per-message 진입 시
+    //     chunk = buffer[0:1700]이 송출분(0..sentLength)을 포함 → 새 메시지에 중복 콘텐츠 → 4번 복제 패턴.
+    //   수정 (v1 롤백 후 v2 적용):
+    //     v1은 buffer.slice(sentLength)로 자르되 첫 chunk를 edit하지 않아 콘텐츠 손실.
+    //     v2는 진입 직전 currentMessage에 첫 STREAM_MAX_CHARS만큼 edit으로 마무리 후 새 메시지로 진행.
+    if (this.buffer.length > STREAM_MAX_CHARS && this.currentMessage && this.sentLength > 0) {
+      const firstChunk = this.buffer.slice(0, STREAM_MAX_CHARS);
+      log('warn', 'DUP-FIX v2 chunk-per-message 진입 — 첫 chunk를 currentMessage에 edit으로 마무리', {
+        sentLength: this.sentLength,
+        firstChunkLen: firstChunk.length,
+        bufferTotal: this.buffer.length,
+      });
+      this.buffer = this.buffer.slice(STREAM_MAX_CHARS);
+      await this._sendOrEdit(firstChunk, true);  // edit으로 currentMessage 마무리 (cumulative)
+      this.currentMessage = null;  // 이후 chunk는 새 메시지로
+      this.sentLength = 0;
+      // fence open 상태 갱신 (firstChunk 끝의 펜스 상태 반영)
+      const fencesInFirst = (firstChunk.match(/```/g) || []).length;
+      if (fencesInFirst % 2 === 1) this.fenceOpen = !this.fenceOpen;
+    }
+    let _dupIter = 0;
+    while (this.buffer.length > STREAM_MAX_CHARS) {
+      const splitAt = this._findSplitPoint(this.buffer, STREAM_MAX_CHARS);
+      let chunk = this.buffer.slice(0, splitAt);
+      this.buffer = this.buffer.slice(splitAt);
+      // [DUP-DIAG] chunk-per-message 진입 — 이전 cumulative edit으로 송출됐을 가능성 있는 sentLength 추적
+      log('info', 'DUP-DIAG chunk-per-message iter', {
+        iter: ++_dupIter,
+        chunkLen: chunk.length,
+        chunkHead: chunk.slice(0, 60),
+        bufferRemaining: this.buffer.length,
+        prevSentLength: this.sentLength,  // 직전 cumulative edit이 송출한 길이
+      });
+
+      // fenceOpen: 이전 청크에서 이미 열린 펜스가 있는지 포함해서 계산
+      const fencesInChunk = (chunk.match(/```/g) || []).length;
+      const openInChunk = ((this.fenceOpen ? 1 : 0) + fencesInChunk) % 2 === 1;
+      if (openInChunk) {
+        // 언어 태그 보존: 마지막 열린 펜스의 언어를 다음 청크에 이어붙임
+        let lang = '';
+        for (const m of chunk.matchAll(/```(\w*)/g)) lang = m[1] || '';
+        chunk += '\n```';
+        this.buffer = '```' + (lang ? lang + '\n' : '\n') + this.buffer;
+        this.fenceOpen = true;  // 버퍼는 다시 펜스 안에서 시작
+      } else {
+        this.fenceOpen = false; // 이 청크 끝에서 펜스 닫힘
+      }
+
+      // chunk는 새 메시지 1개로 송출 (모델 A: chunk-per-message).
+      // _sendOrEdit이 currentMessage가 있으면 edit, 없으면 send. 우리는 강제로 새 메시지 모드.
+      this.currentMessage = null;   // 다음 _sendOrEdit이 channel.send로 새 메시지 생성
+      this.sentLength = 0;          // 새 메시지 시작 → 누적 길이 리셋
+      await this._sendOrEdit(chunk, true);
+      // 송출 후 currentMessage는 새 chunk 메시지로 세팅됨. 다음 chunk를 위해 다시 리셋.
+      this.currentMessage = null;
+      this.sentLength = 0;
+    }
+
+    if (this.buffer.length > 0) {
+      // fenceOpen 업데이트: 남은 버퍼의 펜스 상태 반영 (finalize용)
+      const fencesInRemaining = (this.buffer.match(/```/g) || []).length;
+      if (fencesInRemaining % 2 === 1) this.fenceOpen = !this.fenceOpen;
+      // 잔여 buffer는 모델 B (cumulative edit): currentMessage(또는 null이면 send)에 전체 edit.
+      // sentLength = buffer.length 가 _sendOrEdit 내부에서 마킹됨.
+      await this._sendOrEdit(this.buffer, false);
+    }
+    // P3-1: CHART_DATA / TABLE_DATA 마커가 완성되면 백그라운드 렌더링 사전 실행
+    // finalize 시점에 이미 캐시에 적중하도록 → 전송 지연 단축
+    this._maybePrefetchMarkers();
+  }
+
+  /**
+   * P3-1: 스트리밍 중 CHART_DATA JSON이 balanced 완료되면 백그라운드로 PNG 렌더링.
+   * finalize 시점에 `_imageCache`에서 바로 적중 → 차트 표시 체감 지연 최소화.
+   * 실패/미완성은 silent — finalize의 정식 경로가 재시도.
+   */
+  _maybePrefetchMarkers() {
+    if (this._chartPrefetchScheduled) return;
+    const buf = this.buffer;
+    const idx = buf.indexOf('CHART_DATA:{');
+    if (idx < 0) return;
+    // balanced JSON 찾기
+    const after = buf.slice(idx + 'CHART_DATA:'.length);
+    let depth = 0, inStr = false, escape = false, end = -1;
+    for (let i = 0; i < after.length; i++) {
+      const ch = after[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\') { escape = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === '{' || ch === '[') depth++;
+      if (ch === '}' || ch === ']') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) return; // 아직 JSON 미완성 — 다음 flush 시 재시도
+    const rawJson = after.slice(0, end + 1);
+    let chartJson;
+    try { chartJson = JSON.parse(rawJson); } catch { return; }
+    this._chartPrefetchScheduled = true;
+    const key = _cacheKey(chartJson);
+    if (_imageCacheGet(key)) return; // 이미 캐시됨
+    // 백그라운드 렌더링 — 메인 flush 루프 차단 금지
+    setTimeout(async () => {
+      try {
+        const { type = 'line', title, labels = [], datasets = [] } = chartJson;
+        const palette = ['#5865f2', '#57f287', '#fee75c', '#ed4245', '#eb459e', '#faa61a'];
+        const normalizedDatasets = datasets.map((d, i) => ({
+          borderColor: d.borderColor || d.color || palette[i % palette.length],
+          backgroundColor: d.backgroundColor ?? (type === 'line' ? 'transparent' : (d.color || palette[i % palette.length]) + '99'),
+          borderWidth: d.borderWidth ?? 2,
+          pointRadius: d.pointRadius ?? 3,
+          tension: d.tension ?? 0.3,
+          fill: d.fill ?? false,
+          ...d,
+        }));
+        const config = {
+          type,
+          data: { labels, datasets: normalizedDatasets },
+          options: {
+            responsive: false, animation: false, devicePixelRatio: 2,
+            plugins: {
+              title: { display: !!title, text: title ?? '', color: '#fff', font: { size: 15, weight: 'bold' }, padding: { bottom: 12 } },
+              legend: { labels: { color: '#dbdee1', font: { size: 12 }, padding: 16, usePointStyle: true } },
+            },
+            scales: (type !== 'pie' && type !== 'doughnut') ? {
+              x: { ticks: { color: '#9b9fa8', font: { size: 11 } }, grid: { color: '#3b3d43' }, border: { color: '#3b3d43' } },
+              y: { ticks: { color: '#9b9fa8', font: { size: 11 } }, grid: { color: '#3b3d43' }, border: { color: '#3b3d43' } },
+            } : undefined,
+          },
+        };
+        const renderer = _getChartNodeCanvas();
+        const buf = await renderer.renderToBuffer(config);
+        _imageCacheSet(key, buf);
+        log('info', 'CHART_DATA prefetch rendered', { key, size: buf.length });
+      } catch (err) {
+        log('debug', 'CHART_DATA prefetch failed (non-blocking)', { error: err.message });
+      }
+    }, 0);
+  }
+
+  _findSplitPoint(text, maxLen) {
+    // [2026-06-07] 코드블록(```) 한가운데서 쪼개져 코드가 "생략된 것처럼" 보이는 문제 차단.
+    //   maxLen이 코드블록 안이면 여는 펜스 직전으로 split을 끌어올려 코드블록을 통째로 다음 청크로 보낸다.
+    //   (코드블록 자체가 한 청크보다 크면 -1 반환 → 아래 기존 로직으로 폴백, 펜스 연속성이 처리.)
+    const codeAdj = this._adjustForCodeFence(text, maxLen);
+    if (codeAdj > 0 && codeAdj < maxLen) return codeAdj;
+    // [2026-05-22 v7d] 마크다운 테이블 행(`|...|`) 중간/사이 절단 방지.
+    //   buffer 끝쪽이 미완성 테이블 (incomplete `| |` 행)이면 chunk 경계가 그 안에 떨어졌을 때
+    //   tableToList 변환 실패 → 다음 flush에서 일부만 다시 변환 → 송출 깨짐 발생.
+    //   해법: maxLen 부근에 `|...|` 행이 있으면 그 블록 위로 split 끌어올림.
+    const safeMax = this._adjustForTableBoundary(text, maxLen);
+    const effectiveMax = safeMax > 0 ? safeMax : maxLen;
+
+    // 우선순위 1: ### 헤딩 경계 (섹션 단위 분할)
+    const headingRe = /\n(?=###? )/g;
+    let bestHeading = -1;
+    let m;
+    while ((m = headingRe.exec(text)) !== null) {
+      if (m.index > 0 && m.index <= effectiveMax) bestHeading = m.index;
+    }
+    if (bestHeading > effectiveMax * 0.4) return bestHeading + 1;
+
+    // 우선순위 2: --- 구분선
+    const hrIdx = text.lastIndexOf('\n---', effectiveMax);
+    if (hrIdx > effectiveMax * 0.4) return hrIdx + 1;
+
+    // 우선순위 3: 빈 줄 (단락 경계)
+    const blankIdx = text.lastIndexOf('\n\n', effectiveMax);
+    if (blankIdx > effectiveMax * 0.5) return blankIdx + 1;
+
+    // 우선순위 4: 일반 줄바꿈
+    const candidate = text.lastIndexOf('\n', effectiveMax);
+    if (candidate > effectiveMax * 0.6) return candidate + 1;
+
+    // 우선순위 5: 공백
+    const lastSpace = text.lastIndexOf(' ', effectiveMax);
+    if (lastSpace > effectiveMax * 0.6) return lastSpace + 1;
+
+    return effectiveMax;
+  }
+
+  /**
+   * [2026-06-07] 코드펜스(```) 블록을 가로질러 split되지 않도록 maxLen을 조정.
+   * maxLen이 열린 코드블록 안이면 그 블록의 여는 펜스 직전 위치를 반환(split을 위로 끌어올림 → 코드블록 통째로 다음 청크).
+   * 코드블록이 한 청크보다 커서 위로 못 끌어올리면 -1 반환(호출자는 기존 로직으로 폴백, 펜스 연속성이 처리).
+   */
+  _adjustForCodeFence(text, maxLen) {
+    if (maxLen >= text.length) return maxLen;
+    const before = text.slice(0, maxLen);
+    const fenceCount = (before.match(/```/g) || []).length;
+    if (fenceCount % 2 === 0) return maxLen; // 코드블록 밖 → 조정 불필요
+    const openIdx = before.lastIndexOf('```');
+    if (openIdx <= 0) return maxLen;
+    const lineStart = text.lastIndexOf('\n', openIdx - 1);
+    const split = lineStart >= 0 ? lineStart + 1 : openIdx;
+    if (split < maxLen * 0.2) return -1; // 코드블록이 한 청크보다 큼 → 폴백
+    return split;
+  }
+
+  /**
+   * [2026-05-22 v7d] 마크다운 테이블 블록을 가로지르지 않도록 maxLen을 조정.
+   * maxLen 직전·직후 라인이 `|`로 시작하면 그 테이블 블록의 시작 위치를 반환 (split을 위로 끌어올림).
+   * 위로 올릴 공간이 없으면 -1 반환 (호출자는 원래 maxLen 사용 → 최후엔 finalize 단계 안전망 발동).
+   */
+  _adjustForTableBoundary(text, maxLen) {
+    if (maxLen >= text.length) return maxLen;
+    // maxLen 위치에서 가장 가까운 줄바꿈을 기점으로 라인 단위 검사
+    const around = text.slice(0, Math.min(text.length, maxLen + 200));
+    const lines = around.split('\n');
+    // 각 라인의 시작 offset 계산
+    const offsets = [0];
+    for (let i = 0; i < lines.length - 1; i++) {
+      offsets.push(offsets[i] + lines[i].length + 1);
+    }
+    // maxLen이 속한 라인 인덱스
+    let cur = 0;
+    for (let i = 0; i < offsets.length; i++) {
+      if (offsets[i] <= maxLen) cur = i; else break;
+    }
+    // 현재 라인 또는 직전 라인이 `|...`로 시작하는지
+    const isTableLine = (idx) => idx >= 0 && idx < lines.length && /^\s*\|/.test(lines[idx]);
+    if (!isTableLine(cur) && !isTableLine(cur - 1)) return maxLen;
+    // 위로 거슬러 테이블 블록 시작 찾기
+    let blockStart = cur;
+    while (blockStart > 0 && isTableLine(blockStart - 1)) blockStart--;
+    // 블록 시작이 너무 위 (maxLen의 30% 미만)면 양보하지 않음 — 최후 안전망에 위임
+    if (offsets[blockStart] < maxLen * 0.3) return -1;
+    return offsets[blockStart];
+  }
+
+  async _sendOrEdit(content, isFinal) {
+    this._textSent = true;  // Discord에 텍스트 전송 시작 — embed 업데이트 중단
+    log('debug', '_sendOrEdit called', { contentLen: content.length, isFinal, isPlaceholder: this._isPlaceholder, finalized: this.finalized });
+    // Clear timers on transition from placeholder to streaming
+    if (this._statusTimer) {
+      clearTimeout(this._statusTimer);
+      this._statusTimer = null;
+    }
+    if (this._progressTimer) {
+      clearInterval(this._progressTimer);
+      this._progressTimer = null;
+    }
+    content = formatForDiscord(content, { channelId: this.channelId });
+    const converted = convertTablesToList(content);
+    if (converted !== content) {
+      log('warn', 'Markdown table detected — converted to bullet list for Discord mobile', { channelId: this.channelId });
+      content = converted;
+    }
+
+    // [2026-05-08 G6 시스템 가드] chunk 분할로 테이블 경계가 잘려 위 변환이 못 잡은 경우의 최후 안전망.
+    // tableToList는 헤더+구분선+데이터 3개 라인이 한 chunk에 모여야 작동하는데
+    // streaming chunk 분할 시 일부만 들어오면 우회됨. 사고 사례: 사용자가 깨진 테이블 신고 (5/8).
+    // 이 단계에서 `|...|...|` 잔존하면 라인 단위로 강제 bullet 변환.
+    if (/^\|.+\|.+\|/m.test(content)) {
+      log('warn', 'Markdown table residue after format pipeline — forcing bullet escape', { channelId: this.channelId });
+      content = content.replace(/^\|(.+)\|$/gm, (match, inner) => {
+        if (/^[\s:|-]*-+[\s:|-]*$/.test(inner)) return '';  // 구분선 제거
+        const cells = inner.split('|').map(c => c.trim()).filter(Boolean);
+        if (cells.length === 0) return match;
+        const [first, ...rest] = cells;
+        return rest.length > 0 ? `- **${first}** · ${rest.join(' · ')}` : `- **${first}**`;
+      }).replace(/\n{3,}/g, '\n\n');
+    }
+    // Safety: formatForDiscord/convertTablesToList may expand content beyond Discord 2000 limit.
+    // 트런케이션 대신 분할 전송 — 내용 유실 없음.
+    // 1990 → 1800 하향: 헤딩/단락 경계를 더 쉽게 찾도록 여유 확보 (2026-04-20).
+    const DISCORD_LIMIT = 1990; // 2026-04-20 원복: 1800 → 1990 (split 빈도 최소화)
+    // [2026-04-23 핫픽스 Fix-50035] "분리 송출" 버그 수정:
+    //  Discord API error 50035 "content must be 2000 or fewer" 는 원본 content가 아닌
+    //  _composeDisplay()가 cursor(▌) + 🧠 thinking prefix + statusBar(-#) + tool status를
+    //  덧붙인 **displayContent** 기준으로 검사함. 기존 코드는 `content.length > 1990`만
+    //  체크해서 displayContent가 2000+ 된 경우 edit 실패 → _resumeAsNewMessage 경로 →
+    //  placeholder 잔존 + 본문 new message = "2개로 분리된 듯한" 중첩 발생.
+    //  수정: content + displayContent 둘 중 하나라도 한계 초과면 split 경로 진입.
+    //  content는 1700 이하로 split해서 확장분(cursor·prefix·statusBar ~300자) 여유 확보.
+    const CONTENT_SAFE_LIMIT = 1700; // 확장분 여유 300자
+    const _previewDisplay = this._composeDisplay(content, isFinal);
+    if (content.length > CONTENT_SAFE_LIMIT || _previewDisplay.length > DISCORD_LIMIT) {
+      // [2026-04-26 RC-1 안전망] 정상 경로에서는 _flushInner의 STREAM_MAX_CHARS(1700)가
+      //   content를 1700 이하로 자르므로 이 분기는 발동되지 않음. 발동되면 계약 위반 또는
+      //   _composeDisplay가 statusBar/cursor로 1700 → 1990+ 부풀린 케이스. 양쪽 다 안전망.
+      //
+      //   주의: 이 split 경로는 buffer/sentLength 외부 상태를 건드리지 않음 (책임 경계).
+      //         호출자(_flushInner)가 chunk를 이미 슬라이스했으므로, 이 경로가 끝난 후
+      //         호출자가 currentMessage=null + sentLength=0 을 어떻게 보든 정합성 유지.
+      log('warn', '_sendOrEdit: limit exceeded (content or display) — splitting (안전망 발동, 계약 점검 필요)', {
+        contentLen: content.length, displayLen: _previewDisplay.length
+      });
+      const parts = _splitIntoChunks(content, CONTENT_SAFE_LIMIT);
+      // [2026-04-23 Fix-50035 P2] split 루프 보강:
+      //  결함 1) L929 `partDisplay = (...) ? part : part` 삼항 양쪽 동일값 → 중간 chunk에도 cursor 미부착
+      //         수정: 중간/미완료 chunk는 끝에 '▌' 한 글자 부착 (1자 증가 → 1701자, DISCORD_LIMIT 안전)
+      //  결함 2) placeholder edit / channel.send 실패 시 silent 실패 → placeholder 잔존 + 남은 chunks 유실
+      //         수정: 각 chunk 처리를 try/catch로 감싸서 실패 시 placeholder 정리 + channel.send 폴백
+      //         폴백도 실패하면 남은 chunks 포기하고 return (debounce 흐름에서 재시도 유도)
+      for (let pi = 0; pi < parts.length; pi++) {
+        const part = parts[pi];
+        const isLast = pi === parts.length - 1;
+        // 중간 chunk 또는 미완료(스트리밍 중) 마지막 chunk에는 커서(▌) 부착 — plain chunk와 시각 구분
+        const partDisplay = (!isLast || (!this.finalized && !isFinal)) ? `${part}▌` : part;
+        const payload = { content: partDisplay, embeds: [], components: [], flags: MessageFlags.SuppressEmbeds };
+        try {
+          if (pi === 0 && this._isPlaceholder && this.currentMessage) {
+            // placeholder edit 먼저 시도 — 성공 시에만 flag 해제
+            await this.currentMessage.edit(payload);
+            this._isPlaceholder = false;
+            this.sentLength = part.length;
+          } else if (pi === 0 && !this.currentMessage && this.replyTo) {
+            try { this.currentMessage = await this.replyTo.reply(payload); }
+            catch { this.currentMessage = await this.channel.send(payload); }
+            this.replyTo = null;
+            this.sentLength = part.length;
+          } else if (pi === 0 && this.currentMessage && !this._isPlaceholder) {
+            // [DUP-FIX v3 2026-04-26] cumulative edit 모드 — currentMessage에 첫 chunk를 edit으로 마무리
+            // 결함 (수정 전): 이 케이스에서 else 분기로 channel.send 호출 → 기존 currentMessage 그대로 +
+            //   새 메시지 발송 = 중복 송출. 12:44~13:01 사이 10건 warn 발동 시 매번 일어난 결함.
+            // 수정: 첫 chunk는 currentMessage에 edit으로 마무리하고, 다음 chunk부터 새 메시지로 분배.
+            log('warn', 'DUP-FIX v3 split pi=0 cumulative edit 모드 — currentMessage에 edit 마무리', {
+              partLen: part.length, totalParts: parts.length, currentMessageId: this.currentMessage.id,
+            });
+            await this.currentMessage.edit(payload);
+            this.sentLength = part.length;
+          } else {
+            this.currentMessage = await this.channel.send(payload);
+            this.sentLength = part.length;
+          }
+        } catch (partErr) {
+          log('error', '_sendOrEdit split: part send/edit failed — fallback to channel.send', {
+            pi, partLen: part.length, err: partErr.message
+          });
+          // placeholder 잔존 시 삭제 후 새 메시지로 재시작
+          if (this._isPlaceholder && this.currentMessage) {
+            try { await this.currentMessage.delete(); } catch (_delErr) {}
+            this.currentMessage = null;
+            this._isPlaceholder = false;
+          }
+          try {
+            this.currentMessage = await this.channel.send(payload);
+            this.sentLength = part.length;
+          } catch (sendErr) {
+            log('error', '_sendOrEdit split: fallback channel.send also failed — aborting remaining parts', {
+              pi, remaining: parts.length - pi - 1, err: sendErr.message
+            });
+            return; // 남은 chunks 포기, 다음 debounce tick에서 재시도 유도
+          }
+        }
+        if (!isLast) await new Promise(r => setTimeout(r, 300)); // rate limit 방지
+      }
+      return;
+    }
+    // maskTechDetails: 비기술 채널에서만 선택 적용 (개발자 채널은 경로/PID 필요)
+    // LLM 레벨 few-shot으로 이미 가이드 중 — 전체 파이프라인 강제 적용 금지
+    // P0-1: tool status / thinking prefix + 커서 합성 통합
+    const displayContent = this._composeDisplay(content, isFinal);
+    const row = this._stopRow();
+    const components = (this.finalized || isFinal) ? [] : (row ? [row] : []);
+
+    try {
+      // Placeholder → edit in place (delete+resend causes message disappearing flash)
+      // _unregisterPlaceholder는 finalize() 완료 시점에만 호출 (orphan cleanup이 버튼 제거할 수 있도록)
+      if (this._isPlaceholder && this.currentMessage) {
+        this._isPlaceholder = false;
+        await this.currentMessage.edit({ content: displayContent, embeds: [], components, flags: MessageFlags.SuppressEmbeds });
+        this.sentLength = content.length;
+        return;
+      }
+
+      if (!this.currentMessage) {
+        const payload = { content: displayContent, embeds: [], components, flags: MessageFlags.SuppressEmbeds };
+        if (this.replyTo) {
+          try {
+            this.currentMessage = await this.replyTo.reply(payload);
+          } catch {
+            // 원본 메시지가 삭제된 경우 reply 실패 → channel.send로 폴백
+            this.currentMessage = await this.channel.send(payload);
+          }
+          this.replyTo = null;
+        } else {
+          this.currentMessage = await this.channel.send(payload);
+        }
+        this.sentLength = content.length;
+      } else {
+        await this.currentMessage.edit({ content: displayContent, embeds: [], components, flags: MessageFlags.SuppressEmbeds });
+        this.sentLength = content.length;
+      }
+      // buffer 관리는 _flush()에서 처리 — 여기서 지우면 분할 시 나머지 유실
+    } catch (err) {
+      log('error', 'StreamingMessage send/edit failed', { error: err.message, code: err.code });
+      // Rate limit (429) 또는 일시적 오류 시 1회 retry
+      if (err.status === 429 || err.code === 'RateLimited' || err.message?.includes('rate')) {
+        const retryAfter = (err.retryAfter ?? 1) * 1000 + 200;
+        log('warn', '_sendOrEdit rate limited — retrying', { retryAfter });
+        await new Promise(r => setTimeout(r, retryAfter));
+        try {
+          const retryDisplay = this._composeDisplay(content, isFinal);
+          if (this.currentMessage) {
+            await this.currentMessage.edit({ content: retryDisplay, embeds: [], components: [], flags: MessageFlags.SuppressEmbeds });
+          } else {
+            this.currentMessage = await this.channel.send({ content: retryDisplay, embeds: [], components: [], flags: MessageFlags.SuppressEmbeds });
+          }
+          this.sentLength = content.length;
+          log('info', '_sendOrEdit retry succeeded');
+          return;
+        } catch (retryErr) {
+          log('error', '_sendOrEdit retry also failed', { error: retryErr.message });
+          // P2-3: stream resumption — retry도 실패하면 차이분을 새 메시지로 분할 전송
+          await this._resumeAsNewMessage(content, isFinal, retryErr);
+        }
+      } else {
+        // 429 외 다른 영구성 오류(권한/메시지 삭제 등) — 즉시 resumption 시도
+        await this._resumeAsNewMessage(content, isFinal, err);
+      }
+    }
+  }
+
+  /**
+   * P2-3: edit 실패 후 차이분(delta)을 새 메시지로 이어 전송.
+   *
+   * 기존 currentMessage는 이미 전송된 sentLength 까지 보존되어 있다고 가정.
+   * content[sentLength:] 만 new message로 send → currentMessage 교체 → 이후 append는 새 메시지에 대해 edit.
+   *
+   * 삭제/권한 오류로 새 send 조차 실패하면 silent (로그만).
+   */
+  async _resumeAsNewMessage(content, isFinal, originalErr) {
+    const delta = this.sentLength > 0 ? content.slice(this.sentLength) : content;
+    if (!delta || !delta.trim()) {
+      log('debug', '_resumeAsNewMessage: no delta, skipping');
+      return;
+    }
+    // [2026-04-23 핫픽스 Fix-50035 보험] placeholder 메시지 정리:
+    //  sentLength=0 + _isPlaceholder 상태에서 edit 실패 시 이 경로 진입.
+    //  placeholder "✅..." 또는 "ℹ️..." 메시지가 채널에 남아있고 본문을 new send하면
+    //  사용자 눈에 "placeholder 메시지 + 본문 메시지" 2개로 **분리 송출**처럼 보임.
+    //  대응: placeholder 메시지 삭제 시도 (실패해도 silent, new send는 계속 진행).
+    if (this._isPlaceholder && this.currentMessage && this.sentLength === 0) {
+      try {
+        await this.currentMessage.delete();
+        log('debug', '_resumeAsNewMessage: stale placeholder deleted (duplicate prevention)');
+      } catch (delErr) {
+        log('debug', '_resumeAsNewMessage: placeholder delete failed (ignoring)', {
+          err: delErr.message, code: delErr.code
+        });
+      }
+      this.currentMessage = null;
+      this._isPlaceholder = false;
+    }
+    try {
+      const resumeMarker = '\n\n-# ↪️ 이어서…';
+      const resumeDisplay = this._composeDisplay(delta, isFinal);
+      const newMsg = await this.channel.send({
+        content: resumeMarker + '\n' + resumeDisplay,
+        embeds: [],
+        components: [],
+        flags: MessageFlags.SuppressEmbeds,
+      });
+      // 새 메시지를 currentMessage 로 교체 → 이후 append/edit 타겟 이동
+      this.currentMessage = newMsg;
+      this.sentLength = content.length;
+      log('warn', '_resumeAsNewMessage: split successful (edit failed, new msg created)', {
+        newMsgId: newMsg.id, deltaLen: delta.length, originalErr: originalErr?.message?.slice(0, 120),
+      });
+    } catch (splitErr) {
+      log('error', '_resumeAsNewMessage failed — content may be lost', {
+        error: splitErr.message,
+        deltaLen: delta.length,
+      });
+    }
+  }
+
+  async finalize() {
+    // [DUP-DIAG 2026-04-26] finalize 진입 추적 (race 가설 H1 검증용)
+    log('info', 'DUP-DIAG finalize 진입', {
+      bufferLen: this.buffer.length,
+      sentLength: this.sentLength,
+      currentMessageId: this.currentMessage?.id || null,
+      finalizeComplete: this._finalizeComplete,
+      finalized: this.finalized,
+    });
+    // 멱등성 보장: 비활성 타임아웃 등 이중 호출 시 두 번째는 no-op
+    // (this.finalized는 _sendOrEdit 커서 표시에 여전히 사용되므로 별도 플래그 사용)
+    if (this._finalizeComplete) {
+      log('warn', 'DUP-DIAG finalize 멱등 가드 발동 — 중복 호출 차단됨');
+      return;
+    }
+    this._finalizeComplete = true;
+    this.finalized = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (this._statusTimer) {
+      clearTimeout(this._statusTimer);
+      this._statusTimer = null;
+    }
+    if (this._progressTimer) {
+      clearInterval(this._progressTimer);
+      this._progressTimer = null;
+    }
+    if (this.fenceOpen) {
+      this.buffer += '\n```';
+      this.fenceOpen = false;
+    }
+    // Placeholder가 남아있는데 실제 내용이 없으면 → 조용히 삭제
+    // (hasRealContent가 true면 buffer에 내용이 있으므로 아래 _flush()에서 처리)
+    if (this._isPlaceholder && !this.hasRealContent) {
+      if (this.currentMessage) {
+        _unregisterPlaceholder(this.currentMessage.id);
+        try { await this.currentMessage.delete(); } catch (err) { recordSilentError('streaming.finalize.deletePlaceholder', err); }
+      }
+      return;
+    }
+    // 진행 중인 flush가 있으면 완료될 때까지 대기.
+    // (_flushing 플래그만 보고 루프하는 polling 방식 대신 Promise await로 정확하게 동기화)
+    if (this._flushDone) {
+      await this._flushDone;
+    }
+    // 대기 후 buffer에 아직 내용이 남아있으면(append가 flush 도중 들어온 경우 포함) 최종 전송
+    if (this.buffer.length > 0) {
+      await this._flush();  // _sendOrEdit 내부에서 placeholder→text 전환 처리
+    } else if (this.currentMessage) {
+      try {
+        // 커서 ▌ + 진행 상태 바(`-# ⏳ ...`) 잔류 방지.
+        // Discord 캐시 content에는 이전 _sendOrEdit가 붙여둔 statusBar가 literal로 남아있으므로,
+        // 커서만 제거하면 `⏳ 🤖 Opus 4.7 · ⏱️ Ns · 📊 N턴 · 🎫 Nk` 줄이 두 번째 푸터로 노출됨.
+        let cleaned = (this.currentMessage.content || '').replace(/ ▌$/, '');
+        cleaned = cleaned.replace(/\n{1,2}-# ⏳ [^\n]*$/, '');
+        await this.currentMessage.edit({ content: cleaned, components: [] });
+      } catch (err) { recordSilentError('streaming.finalize.editClean', err); }
+    }
+    // 안전망: rate limit 등으로 마지막 edit가 실패했을 경우 커서 잔류 방지
+    // _flush()/_sendOrEdit에서 retry 했어도 실패했다면 여기서 여러 번 재시도 (말짤림 방지)
+    if (this.currentMessage) {
+      // buffer가 남아 있으면 전체 내용으로 복원, 없으면 Discord 캐시에서 커서만 제거
+      const finalContent = this.buffer.length > 0
+        ? formatForDiscord(this.buffer, { channelId: this.channelId })
+        : (this.currentMessage.content || '').replace(/ ▌$/, '');
+      if ((this.currentMessage.content || '').endsWith(' ▌')) {
+        log('warn', 'finalize: cursor still present after flush — force removing with retry');
+        // Exponential backoff retry: rate limit 심각해도 최종적으로 반영
+        const delays = [500, 1500, 3000];
+        let success = false;
+        for (const delay of delays) {
+          try {
+            await new Promise(r => setTimeout(r, delay));
+            await this.currentMessage.edit({ content: finalContent, components: [] });
+            success = true;
+            break;
+          } catch (err) {
+            recordSilentError('streaming.finalize.cursorRemovalRetry', err);
+          }
+        }
+        if (!success) {
+          log('error', 'finalize: all cursor removal retries failed — 응답 말짤림 가능성', {
+            messageId: this.currentMessage.id, contentLen: finalContent.length,
+          });
+        }
+      }
+    }
+    if (this.currentMessage) {
+      _unregisterPlaceholder(this.currentMessage.id);
+    }
+    await this._extractCodeBlockFiles();
+    await this._extractAndSendMarkers();
+    // P1-1: 인용 각주 자동 포맷 (2개 이상 감지 시 [^N] 치환 + 출처 블록)
+    await this._maybeFormatCitations();
+    await this._wrapInCV2();
+    // P0-3: 아티팩트 분리 — 코드 첨부 후에도 남은 본문이 여전히 길면 board 업로드
+    await this._maybeUploadArtifact();
+    // P1-2: 종료 액션 버튼 행(재생성/요약/다운로드) — 응답 길이 임계 충족 시 편집으로 부착
+    await this._appendActionButtons();
+    // P1-3: 긴 응답 자동 Thread — 채널 직접 응답 & 3000자+ 시 follow-up 스레드 생성
+    await this._maybeCreateThread();
+    // P3-3: A/B 실험 outcome 기록 — ledger에 elapsed/edits/variant 누적
+    this._recordExperimentOutcome();
+    // GC 힌트: 대형 버퍼 참조 해제 (응답이 길수록 효과적)
+    this.buffer = '';
+    this._deferredMarkerTail = ''; // [MARKER-ISOLATION] 다음 응답 위해 격리 버퍼 리셋
+    this._inMarkerTail = false;
+    this._statusLines = [];
+  }
+
+  /**
+   * P3-3: throttle-v1 outcome ledger 기록 (응답 1회당 1 entry).
+   * silent — 실패해도 응답 흐름에 영향 없음.
+   */
+  _recordExperimentOutcome() {
+    if (this._experimentRecorded) return;
+    this._experimentRecorded = true;
+    if (!this._userId || !this._throttleVariant) return;
+    try {
+      recordOutcome('throttle-v1', this._userId, {
+        variant: this._throttleVariant,
+        elapsedMs: Date.now() - this._startedAtMs,
+        editCount: this._editCount,
+        bufferLen: this._textSent ? (this.currentMessage?.content?.length ?? 0) : 0,
+        channelName: this._channelName,
+      });
+    } catch { /* 응답 차단 금지 */ }
+  }
+
+  /**
+   * P1-2: 최종 응답에 액션 버튼 행(재생성/요약/다운로드) 부착.
+   *
+   * 조건:
+   *   - currentMessage 존재
+   *   - sessionKey 존재 (핸들러가 customId 파싱)
+   *   - 응답 본문 ≥ 600자 (짧은 응답에는 버튼 노이즈 회피)
+   *   - 이미 components 붙은 메시지(CV2/마커 카드)면 스킵 — 중복 방지
+   *
+   * 구현:
+   *   현재 메시지를 edit({ components: [ActionRow] })로 업데이트.
+   *   Discord.js에서 평문 메시지도 components 추가 가능(IsComponentsV2 플래그 없을 때).
+   *   실패 시 silent — 채팅 흐름 차단 금지.
+   */
+  async _appendActionButtons() {
+    if (!this.currentMessage || !this.sessionKey) return;
+    if (this._markerCardSent) return; // CV2 마커 카드가 이미 전송됨
+    const content = this.currentMessage.content || '';
+    if (content.length < 600) return; // 짧은 응답 스킵
+    // 이미 components가 붙어있으면(예: _wrapInCV2 경로) 중복 방지
+    try {
+      const existing = this.currentMessage.components;
+      if (Array.isArray(existing) && existing.length > 0) return;
+    } catch { /* ignore */ }
+
+    try {
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`regen_${this.sessionKey}`)
+          .setLabel('🔄 재생성')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`summarize_${this.sessionKey}`)
+          .setLabel('📝 요약')
+          .setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder()
+          .setCustomId(`download_${this.sessionKey}`)
+          .setLabel('📄 다운로드')
+          .setStyle(ButtonStyle.Secondary),
+      );
+      await this.currentMessage.edit({ content, components: [row] });
+      log('debug', 'action buttons attached', {
+        sessionKey: this.sessionKey,
+        contentLen: content.length,
+      });
+    } catch (err) {
+      log('warn', '_appendActionButtons failed (non-critical)', { error: err.message });
+    }
+  }
+
+  /**
+   * P3-1: CHART_DATA / TABLE_DATA 마커 조기 전송.
+   *
+   * opt-in: CHART_DATA_EARLY_SEND=1 env.
+   * buffer에서 마커 완성분만 제거 + 이미지 렌더 + 채널 전송 (비차단).
+   * 조기 전송된 마커 타입은 finalize의 _extractAndSendMarkers에서 skip.
+   *
+   * 실패 / 비활성 시 silent.
+   */
+  async _tryEarlyMarkerSend() {
+    try {
+      const { isEarlySendEnabled, peekCompleteMarker } = await import('./early-marker.js');
+      if (!isEarlySendEnabled()) return;
+      const hit = peekCompleteMarker(this.buffer, this._markerEarlySent);
+      if (!hit) return;
+      // 버퍼에서 해당 마커 라인 제거 (이후 finalize가 중복 전송 안 하도록 Set에도 등록)
+      this.buffer = this.buffer.replace(hit.raw, '').replace(/^\n/m, '');
+      this._markerEarlySent.add(hit.name);
+      // 실제 이미지 렌더·전송은 비동기로 띄워 다음 flush 흐름을 막지 않음
+      setTimeout(() => this._renderAndSendEarlyMarker(hit).catch(err => {
+        log('warn', 'early marker render failed (non-critical)', { name: hit.name, error: err.message });
+      }), 0);
+    } catch (err) {
+      log('debug', '_tryEarlyMarkerSend skipped', { error: err.message });
+    }
+  }
+
+  /** 조기 마커 렌더링·전송 (CHART_DATA 만 처리 — TABLE은 Chrome 비용 높음). */
+  async _renderAndSendEarlyMarker({ name, json }) {
+    if (name !== 'CHART_DATA') return;
+    const { type = 'line', title, labels = [], datasets = [] } = json;
+    const colorPalette = ['#5865f2', '#57f287', '#fee75c', '#ed4245', '#eb459e', '#faa61a'];
+    const normalizedDatasets = datasets.map((d, i) => ({
+      ...d,
+      borderColor: d.borderColor || d.color || colorPalette[i % colorPalette.length],
+      backgroundColor: d.backgroundColor || ((d.borderColor || d.color || colorPalette[i % colorPalette.length]) + '33'),
+    }));
+    const cfg = {
+      type, data: { labels, datasets: normalizedDatasets },
+      options: {
+        plugins: {
+          title: title ? { display: true, text: title, color: '#fff' } : undefined,
+          legend: { labels: { color: '#fff' } },
+        },
+        scales: type === 'pie' || type === 'doughnut'
+          ? {}
+          : { x: { ticks: { color: '#ddd' } }, y: { ticks: { color: '#ddd' } } },
+      },
+    };
+    const canvas = _getChartNodeCanvas();
+    const buf = await canvas.renderToBuffer(cfg, 'image/png');
+    await this.channel.send({
+      content: '-# ⏳ 차트 먼저 보내드립니다 (본문은 계속 작성 중)',
+      files: [new AttachmentBuilder(buf, { name: 'chart-early.png' })],
+    });
+    log('info', 'CHART_DATA early-sent', { channel: this.channel.id });
+  }
+
+  /**
+   * P1-3: 긴 응답 자동 Thread 생성.
+   *
+   * 채널 직접 응답 & 본문 ≥ AUTO_THREAD_MIN(기본 3000자)일 때,
+   * currentMessage에 딸린 follow-up 스레드를 만들고 후속 대화를 유도.
+   * 원본 메시지는 그대로 유지 (스트리밍 결과 훼손 방지).
+   *
+   * 비활성 조건:
+   *   - AUTO_THREAD_ENABLED=0 환경변수
+   *   - 이미 Thread 채널(this.channel.isThread())
+   *   - 봇 권한 부족 / channel.type != GuildText
+   *   - ARTIFACT 경로 대형 본문(8000자+) — board로 이관했으므로 스레드 불필요
+   *
+   * 실패 시 silent.
+   */
+  async _maybeCreateThread() {
+    if (process.env.AUTO_THREAD_ENABLED === '0') return;
+    if (!this.currentMessage || !this.channel) return;
+    // 이미 Thread 안이면 중첩 스레드 불가
+    try {
+      if (typeof this.channel.isThread === 'function' && this.channel.isThread()) return;
+    } catch { /* ignore */ }
+
+    const content = this.currentMessage.content || '';
+    const MIN = Number(process.env.AUTO_THREAD_MIN || 3000);
+    const MAX = Number(process.env.AUTO_THREAD_MAX || 8000);
+    // 길이 게이트: MIN 이상 & MAX 미만 (MAX 이상은 artifact로 이관되는 편이 나음)
+    if (content.length < MIN || content.length >= MAX) return;
+
+    try {
+      // Discord.js: GuildText 채널에서 message.startThread 가능
+      if (typeof this.currentMessage.startThread !== 'function') return;
+      const rawTitle = (content.split('\n').map(l => l.trim()).find(l => l.length > 10) || '응답').replace(/^[-*#>`]+\s*/, '');
+      const threadName = rawTitle.length > 90 ? rawTitle.slice(0, 89) + '…' : rawTitle;
+      const thread = await this.currentMessage.startThread({
+        name: `💬 ${threadName}`,
+        autoArchiveDuration: 60, // 1시간 후 자동 아카이브
+        reason: 'Jarvis auto-thread for long response',
+      });
+      if (!thread) return;
+      // 스레드에 후속 대화 유도 메시지
+      await thread.send({
+        content: [
+          '💡 **후속 질문/피드백은 이 스레드에서 이어갈 수 있습니다.**',
+          '-# 채널 메인 스크롤을 방해하지 않기 위해 자동 생성된 스레드입니다.',
+        ].join('\n'),
+      }).catch(() => {});
+      log('info', 'auto-thread created', {
+        messageId: this.currentMessage.id,
+        threadId: thread.id,
+        contentLen: content.length,
+      });
+    } catch (err) {
+      log('warn', '_maybeCreateThread failed (non-critical)', { error: err.message });
+    }
+  }
+
+  /**
+   * P0-3: 아티팩트 자동 분리.
+   * _extractCodeBlockFiles()이 30줄+ 코드를 파일 첨부로 빼낸 '후' 실행됨.
+   * 남은 본문이 여전히 길면(TOTAL_CHARS_THRESHOLD+) board로 업로드하고
+   * 카드 링크를 채널에 추가 전송.
+   *
+   * 비활성 조건:
+   *   - ARTIFACT_ENABLED=0 환경변수
+   *   - AGENT_API_KEY 미설정
+   *   - 실패 시 silent (채팅 흐름 차단하지 않음)
+   */
+  /**
+   * P1-1: 본문에 흩어진 bare citation을 [^N] 각주로 통합 포맷.
+   *
+   * 대상: `[filename.md]`, `(출처: ...)`, `[[wiki]]` — 2개 이상일 때만 적용.
+   * 적용 후: 본문 번호 치환 + 하단 `-# 📚 출처` 블록.
+   *
+   * 실패 시 silent (citation 미형성도 응답 흐름 차단 금지).
+   */
+  async _maybeFormatCitations() {
+    if (!this.currentMessage) return;
+    const content = this.currentMessage.content || '';
+    if (!content || content.length < 200) return; // 짧은 응답은 패스
+    try {
+      const { formatCitations } = await import('./citation-formatter.js');
+      const result = formatCitations(content, { minCitations: 2 });
+      if (!result.changed) return;
+      await this._sendOrEdit(result.content, true);
+      log('info', 'citations formatted', {
+        count: result.citations.length,
+        channel: this.channel.id,
+      });
+    } catch (err) {
+      log('warn', '_maybeFormatCitations failed (non-critical)', { error: err.message });
+    }
+  }
+
+  async _maybeUploadArtifact() {
+    if (!this.currentMessage) return;
+    const content = this.currentMessage.content || '';
+    if (!content || content.length < 2500) return; // threshold 빠른 게이트 (uploader도 재검증)
+    try {
+      const { uploadArtifact, renderArtifactCard } = await import('./artifact-uploader.js');
+      const artifact = await uploadArtifact({
+        content,
+        sessionKey: this.sessionKey,
+        channelName: this._channelName,
+      });
+      if (!artifact) return;
+      // 카드 전송 — 원본 메시지는 그대로 두고 후속 카드로 링크 안내
+      const card = renderArtifactCard(artifact);
+      await this.channel.send({
+        content: card,
+        flags: MessageFlags.SuppressEmbeds,
+      });
+      log('info', 'artifact card sent', { id: artifact.id, channel: this.channel.id });
+    } catch (err) {
+      log('warn', '_maybeUploadArtifact failed (non-critical)', { error: err.message });
+    }
+  }
+
+  /** Post-finalize: extract long code blocks (30+ lines) as file attachments. */
+  async _extractCodeBlockFiles() {
+    if (!this.currentMessage) return;
+    const content = this.currentMessage.content || '';
+    const files = [];
+    let idx = 0;
+
+    const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+    const MAX_FILES = 5;
+
+    const newContent = content.replace(/```(\w*)\n([\s\S]+?)```/g, (match, lang, code) => {
+      const lines = code.split('\n');
+      if (lines.length < CODE_FILE_MIN_LINES) return match;
+      if (files.length >= MAX_FILES) return match;
+      idx++;
+      const ext = LANG_EXT[lang] || lang || 'txt';
+      const filename = `code-${idx}.${ext}`;
+      let buffer = Buffer.from(code, 'utf-8');
+      // Check size and truncate if over limit
+      if (buffer.length > MAX_FILE_SIZE) {
+        const notice = '\n... [파일 크기 초과: 5MB 상한으로 잘림]';
+        const truncated = buffer.slice(0, MAX_FILE_SIZE - notice.length);
+        buffer = Buffer.concat([truncated, Buffer.from(notice)]);
+      }
+      files.push(new AttachmentBuilder(buffer, { name: filename }));
+      return `\u{1F4CE} \`${filename}\` (${lines.length} lines)`;
+    });
+
+    if (files.length === 0) return;
+
+    try {
+      await this.currentMessage.edit({ content: newContent, components: [] });
+      await this.channel.send({ files, flags: MessageFlags.SuppressEmbeds });
+    } catch (err) {
+      log('error', 'Code block file extraction failed', { error: err.message });
+    }
+  }
+
+  /** Post-finalize: extract EMBED_DATA:/CHART_DATA:/CV2_DATA:/TABLE_DATA: markers and send as Discord rich embeds or Components V2. */
+  async _extractAndSendMarkers() {
+    if (!this.currentMessage) return;
+    // [MARKER-ISOLATION 2026-07-13] 스트리밍 중 본문에서 격리해둔 마커 원문을 합쳐 추출 대상에 포함.
+    // (긴 응답에서 마커가 중간 chunk로 실려 마지막 메시지에 없는 경우를 복구)
+    let content = (this.currentMessage.content || '') + (this._deferredMarkerTail ? '\n' + this._deferredMarkerTail : '');
+
+    let embedJson = null;
+    let chartJson = null;
+    let cv2Json = null;
+    let tableJson = null;
+
+    // 마커 추출 헬퍼: 한 줄 매칭 실패 시 멀티라인 JSON까지 시도
+    function _extractMarker(text, prefix) {
+      // 1차: 한 줄 매칭 (정상 케이스)
+      const singleLine = text.match(new RegExp(`^${prefix}:(.+)$`, 'm'));
+      if (singleLine) {
+        try {
+          const parsed = JSON.parse(singleLine[1]);
+          const cleaned = text.replace(new RegExp(`^${prefix}:.+\\n?`, 'm'), '');
+          return { json: parsed, content: cleaned };
+        } catch { /* 한 줄이지만 파싱 실패 — 멀티라인 시도 */ }
+      }
+      // 2차: 멀티라인 매칭 (Claude가 JSON을 줄바꿈해서 출력한 경우)
+      const multiIdx = text.indexOf(`${prefix}:`);
+      if (multiIdx === -1) return null;
+      const afterMarker = text.slice(multiIdx + prefix.length + 1);
+      // JSON 끝 찾기: 중괄호 균형 맞추기
+      let depth = 0; let inStr = false; let escape = false; let end = -1;
+      for (let i = 0; i < afterMarker.length; i++) {
+        const ch = afterMarker[i];
+        if (escape) { escape = false; continue; }
+        if (ch === '\\') { escape = true; continue; }
+        if (ch === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (ch === '{' || ch === '[') depth++;
+        if (ch === '}' || ch === ']') { depth--; if (depth === 0) { end = i; break; } }
+      }
+      if (end === -1) return null;
+      const rawJson = afterMarker.slice(0, end + 1).trim();
+      try {
+        const parsed = JSON.parse(rawJson);
+        const markerFull = text.slice(multiIdx, multiIdx + prefix.length + 1 + end + 1);
+        const cleaned = text.replace(markerFull, '').replace(/^\n/m, '');
+        return { json: parsed, content: cleaned };
+      } catch { return null; }
+    }
+
+    const embedResult = _extractMarker(content, 'EMBED_DATA');
+    if (embedResult) { embedJson = embedResult.json; content = embedResult.content; }
+
+    // P3-1: 다중 CHART_DATA 지원 — 여러 마커를 순차 추출해서 배열에 적재.
+    // 조기 전송(CHART_DATA_EARLY_SEND=1)으로 이미 처리된 경우 finalize는 스킵.
+    const chartJsons = [];
+    if (!this._markerEarlySent?.has('CHART_DATA')) {
+      while (true) {
+        const r = _extractMarker(content, 'CHART_DATA');
+        if (!r) break;
+        chartJsons.push(r.json);
+        content = r.content;
+        if (chartJsons.length >= 6) break; // MediaGallery + rate limit 한계
+      }
+      if (chartJsons.length > 0) chartJson = chartJsons[0];
+    } else {
+      // 남아있는 CHART_DATA 라인이 본문에 혹시 있으면 제거만 수행 (재전송 안 함)
+      content = content.replace(/^CHART_DATA:\{[^\n]+\}\s*$/gm, '').replace(/\n{3,}/g, '\n\n');
+    }
+
+    const cv2Result = _extractMarker(content, 'CV2_DATA');
+    if (cv2Result) { cv2Json = cv2Result.json; content = cv2Result.content; }
+
+    const tableResult = _extractMarker(content, 'TABLE_DATA');
+    if (tableResult) { tableJson = tableResult.json; content = tableResult.content; }
+
+    // Mermaid 코드 블록 감지 (```mermaid ... ```)
+    let mermaidCode = null;
+    const mermaidMatch = content.match(/```mermaid\n([\s\S]+?)```/);
+    if (mermaidMatch) {
+      mermaidCode = mermaidMatch[1].trim();
+      content = content.replace(/```mermaid\n[\s\S]+?```\n?/, '');
+    }
+
+    if (!embedJson && !chartJson && !cv2Json && !tableJson && !mermaidCode) return;
+
+    // Collapse excess blank lines left after marker removal
+    content = content.replace(/\n{3,}/g, '\n\n').trim();
+
+    try {
+      // Edit message: remove raw marker lines (return value 저장 — content 최신화 보장)
+      this.currentMessage = await this.currentMessage.edit({ content: content || '\u200b', components: [] });
+
+      // Send EMBED_DATA as Discord rich embed card
+      if (embedJson) {
+        await this.channel.send({ embeds: [embedJson] });
+      }
+
+      // CHART/TABLE/Mermaid 렌더링 결과 버퍼 — MediaGallery로 번들
+      let chartImgBuf = null;
+      let tableImgBuf = null;
+      let mermaidImgBuf = null;
+      // P3-1: 추가 차트 버퍼 (2번째부터 N번째)
+      const extraChartBufs = [];
+
+      // Send CHART_DATA as Chart.js PNG via chartjs-node-canvas (Chrome 불필요, 순수 Node.js)
+      if (chartJson) {
+        const chartCacheKey = _cacheKey(chartJson);
+        const chartCached = _imageCacheGet(chartCacheKey);
+        if (chartCached) {
+          log('info', 'CHART_DATA cache hit', { key: chartCacheKey });
+          chartImgBuf = chartCached;
+        } else {
+          try {
+            const { type = 'line', title, labels = [], datasets = [] } = chartJson;
+            const colorPalette = ['#5865f2', '#57f287', '#fee75c', '#ed4245', '#eb459e', '#faa61a'];
+            const normalizedDatasets = datasets.map((d, i) => {
+              const color = d.borderColor || d.color || colorPalette[i % colorPalette.length];
+              return {
+                borderColor: color,
+                backgroundColor: d.backgroundColor ?? (type === 'line' ? 'transparent' : color + '99'),
+                borderWidth: d.borderWidth ?? 2,
+                pointRadius: d.pointRadius ?? 3,
+                tension: d.tension ?? 0.3,
+                fill: d.fill ?? false,
+                ...d,
+              };
+            });
+            const chartConfig = {
+              type,
+              data: { labels, datasets: normalizedDatasets },
+              options: {
+                responsive: false,
+                animation: false,
+                devicePixelRatio: 2,
+                plugins: {
+                  title: {
+                    display: !!title,
+                    text: title ?? '',
+                    color: '#fff',
+                    font: { size: 15, weight: 'bold' },
+                    padding: { bottom: 12 },
+                  },
+                  legend: {
+                    labels: { color: '#dbdee1', font: { size: 12 }, padding: 16, usePointStyle: true },
+                  },
+                },
+                scales: (type !== 'pie' && type !== 'doughnut') ? {
+                  x: { ticks: { color: '#9b9fa8', font: { size: 11 } }, grid: { color: '#3b3d43' }, border: { color: '#3b3d43' } },
+                  y: { ticks: { color: '#9b9fa8', font: { size: 11 } }, grid: { color: '#3b3d43' }, border: { color: '#3b3d43' } },
+                } : undefined,
+              },
+            };
+            const renderer = _getChartNodeCanvas();
+            const imgBuf = await renderer.renderToBuffer(chartConfig);
+            _imageCacheSet(chartCacheKey, imgBuf);
+            chartImgBuf = imgBuf;
+          } catch (cErr) {
+            log('error', 'CHART_DATA render failed', { error: cErr.message });
+          }
+        }
+      }
+
+      // P3-1: 추가 차트(2번째부터) 렌더링 — 같은 파이프라인 사용 (캐시 포함)
+      if (chartJsons.length > 1) {
+        for (let ci = 1; ci < chartJsons.length; ci++) {
+          const extraJson = chartJsons[ci];
+          const key = _cacheKey(extraJson);
+          const cached = _imageCacheGet(key);
+          if (cached) { extraChartBufs.push(cached); continue; }
+          try {
+            const { type = 'line', title, labels = [], datasets = [] } = extraJson;
+            const colorPalette = ['#5865f2', '#57f287', '#fee75c', '#ed4245', '#eb459e', '#faa61a'];
+            const normalizedDatasets = datasets.map((d, i) => {
+              const color = d.borderColor || d.color || colorPalette[i % colorPalette.length];
+              return {
+                borderColor: color,
+                backgroundColor: d.backgroundColor ?? (type === 'line' ? 'transparent' : color + '99'),
+                borderWidth: d.borderWidth ?? 2,
+                pointRadius: d.pointRadius ?? 3,
+                tension: d.tension ?? 0.3,
+                fill: d.fill ?? false,
+                ...d,
+              };
+            });
+            const cfg = {
+              type,
+              data: { labels, datasets: normalizedDatasets },
+              options: {
+                responsive: false, animation: false, devicePixelRatio: 2,
+                plugins: {
+                  title: { display: !!title, text: title ?? '', color: '#fff', font: { size: 15, weight: 'bold' }, padding: { bottom: 12 } },
+                  legend: { labels: { color: '#dbdee1', font: { size: 12 }, padding: 16, usePointStyle: true } },
+                },
+                scales: (type !== 'pie' && type !== 'doughnut') ? {
+                  x: { ticks: { color: '#9b9fa8', font: { size: 11 } }, grid: { color: '#3b3d43' }, border: { color: '#3b3d43' } },
+                  y: { ticks: { color: '#9b9fa8', font: { size: 11 } }, grid: { color: '#3b3d43' }, border: { color: '#3b3d43' } },
+                } : undefined,
+              },
+            };
+            const buf = await _getChartNodeCanvas().renderToBuffer(cfg);
+            _imageCacheSet(key, buf);
+            extraChartBufs.push(buf);
+          } catch (eErr) {
+            log('error', 'CHART_DATA extra render failed', { idx: ci, error: eErr.message });
+          }
+        }
+      }
+
+      // TABLE_DATA → Discord mobile-friendly 텍스트 (Chrome PNG 제거 — 2026-04-15)
+      // Chrome 렌더링 PNG 대신 bullet list 형식으로 전송
+      if (tableJson) {
+        let { title, columns = [], dataSource = [] } = tableJson;
+        // string[] columns(["A","B"]) -> object[] normalize; supports both prompt formats
+        columns = columns.map(c => (typeof c === 'string' ? { title: c, dataIndex: c } : c));
+        if (columns.length > 0 && dataSource.length > 0) {
+          try {
+            const lines = [];
+            if (title) lines.push(`**${title}**`);
+            // 헤더: 첫 컬럼 외 나머지 컬럼명 표시
+            const restHeaders = columns.slice(1).map(c => c.title ?? c.dataIndex ?? '').join(' · ');
+            if (restHeaders) lines.push(`*${restHeaders}*`);
+            lines.push('─'.repeat(24));
+            for (const row of dataSource) {
+              const firstCol = columns[0];
+              const firstVal = firstCol ? String(row[firstCol.dataIndex] ?? '') : '';
+              const restVals = columns.slice(1).map(c => String(row[c.dataIndex] ?? '')).join(' · ');
+              lines.push(restVals ? `- **${firstVal}** · ${restVals}` : `- ${firstVal}`);
+            }
+            const tableText = lines.join('\n').slice(0, 2000); // Discord 2000자 제한
+            await this.channel.send({ content: tableText });
+            this._markerCardSent = true;
+            log('info', 'TABLE_DATA sent as text', { rows: dataSource.length });
+          } catch (tErr) {
+            log('error', 'TABLE_DATA text render failed', { error: tErr.message });
+          }
+        }
+      }
+
+      // Mermaid diagram rendering via Chrome singleton (same as TABLE_DATA)
+      if (mermaidCode) {
+        const mermaidCacheKey = _cacheKey({ mermaid: mermaidCode });
+        const mermaidCached = _imageCache.get(mermaidCacheKey);
+        if (mermaidCached) {
+          log('info', 'Mermaid cache hit', { key: mermaidCacheKey });
+          mermaidImgBuf = mermaidCached;
+        } else {
+          let page = null;
+          try {
+            const browser = await _getChromeBrowser();
+            page = await browser.newPage();
+            await page.setViewport({ width: 1280, height: 900, deviceScaleFactor: 2 });
+            const escaped = mermaidCode.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            const html = `<!DOCTYPE html><html><head><meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"><\/script>
+</head><body style="background:#313338;margin:0;padding:24px;display:inline-block;min-width:200px;">
+<pre class="mermaid">${escaped}</pre>
+<script>
+mermaid.initialize({
+  startOnLoad:true, theme:'dark',
+  themeVariables:{
+    darkMode:true, background:'#313338',
+    primaryColor:'#5865f2', primaryTextColor:'#dbdee1',
+    primaryBorderColor:'#4752c4', lineColor:'#9b9fa8',
+    secondaryColor:'#2b2d31', tertiaryColor:'#1e1f22',
+    noteBkgColor:'#2b2d31', noteTextColor:'#dbdee1'
+  }
+});
+<\/script></body></html>`;
+            await page.setContent(html, { waitUntil: 'networkidle0' });
+            await page.waitForSelector('.mermaid svg', { timeout: 15000 });
+            const el = await page.$('.mermaid');
+            const imgBuf = await el.screenshot({ type: 'png' });
+            _imageCache.set(mermaidCacheKey, imgBuf);
+            mermaidImgBuf = imgBuf;
+          } catch (mErr) {
+            log('error', 'Mermaid render failed', { error: mErr.message });
+            _chromeBrowser = null;
+          } finally {
+            if (page) await page.close().catch(() => {});
+          }
+        }
+      }
+
+      // CHART/TABLE/Mermaid 이미지 → MediaGallery + 버튼으로 단일 메시지 전송
+      if (chartImgBuf || tableImgBuf || mermaidImgBuf || extraChartBufs.length > 0) {
+        try {
+          const imgContainer = new ContainerBuilder();
+          const gallery = new MediaGalleryBuilder();
+          const imgFiles = [];
+          if (chartImgBuf) {
+            gallery.addItems(new MediaGalleryItemBuilder().setURL('attachment://chart.png'));
+            imgFiles.push(new AttachmentBuilder(chartImgBuf, { name: 'chart.png' }));
+          }
+          // P3-1: 추가 차트 MediaGallery 아이템 추가 (chart-2.png, chart-3.png, ...)
+          for (let i = 0; i < extraChartBufs.length; i++) {
+            const name = `chart-${i + 2}.png`;
+            gallery.addItems(new MediaGalleryItemBuilder().setURL(`attachment://${name}`));
+            imgFiles.push(new AttachmentBuilder(extraChartBufs[i], { name }));
+          }
+          if (tableImgBuf) {
+            gallery.addItems(new MediaGalleryItemBuilder().setURL('attachment://table.png'));
+            imgFiles.push(new AttachmentBuilder(tableImgBuf, { name: 'table.png' }));
+          }
+          if (mermaidImgBuf) {
+            gallery.addItems(new MediaGalleryItemBuilder().setURL('attachment://diagram.png'));
+            imgFiles.push(new AttachmentBuilder(mermaidImgBuf, { name: 'diagram.png' }));
+          }
+          imgContainer.addMediaGalleryComponents(gallery);
+          const imgRow = this._finalActionRow();
+          if (imgRow) {
+            imgContainer.addSeparatorComponents(new SeparatorBuilder());
+            imgContainer.addActionRowComponents(imgRow);
+          }
+          await this.channel.send({
+            files: imgFiles,
+            components: [imgContainer],
+            flags: MessageFlags.IsComponentsV2,
+          });
+          this._markerCardSent = true;
+        } catch (imgErr) {
+          log('error', 'MediaGallery send failed, falling back to raw files', { error: imgErr.message });
+          // 폴백: 개별 파일 전송
+          if (chartImgBuf) await this.channel.send({ files: [new AttachmentBuilder(chartImgBuf, { name: 'chart.png' })] });
+          // P3-1 폴백: 추가 차트도 개별 전송
+          for (let i = 0; i < extraChartBufs.length; i++) {
+            const name = `chart-${i + 2}.png`;
+            await this.channel.send({ files: [new AttachmentBuilder(extraChartBufs[i], { name })] });
+          }
+          if (tableImgBuf) await this.channel.send({ files: [new AttachmentBuilder(tableImgBuf, { name: 'table.png' })] });
+          if (mermaidImgBuf) await this.channel.send({ files: [new AttachmentBuilder(mermaidImgBuf, { name: 'diagram.png' })] });
+        }
+      }
+
+      // Send CV2_DATA as Discord Components V2
+      // 옵션: thumbnail URL 있으면 첫 블록을 SectionBuilder로 렌더링
+      if (cv2Json) {
+        const { color = 5763719, blocks = [], thumbnail } = cv2Json;
+        if (blocks.length > 0) {
+          const container = new ContainerBuilder().setAccentColor(color);
+          blocks.forEach((block, i) => {
+            // block이 {type, content} 객체 형식이면 content 추출, 아니면 문자열 그대로 사용
+            const blockText = (block && typeof block === 'object' && typeof block.content === 'string')
+              ? block.content
+              : String(block);
+            // 첫 번째 블록 + thumbnail 있으면 SectionBuilder 사용
+            if (i === 0 && thumbnail) {
+              try {
+                const section = new SectionBuilder()
+                  .addTextDisplayComponents(new TextDisplayBuilder().setContent(blockText))
+                  .setThumbnailAccessory(
+                    new ThumbnailBuilder().setURL(thumbnail).setDescription('thumbnail')
+                  );
+                container.addSectionComponents(section);
+              } catch {
+                // SectionBuilder 실패 시 일반 TextDisplay로 폴백
+                container.addTextDisplayComponents(new TextDisplayBuilder().setContent(blockText));
+              }
+            } else {
+              container.addTextDisplayComponents(new TextDisplayBuilder().setContent(blockText));
+            }
+            if (i < blocks.length - 1) {
+              container.addSeparatorComponents(new SeparatorBuilder());
+            }
+          });
+          const cv2Row = this._finalActionRow();
+          if (cv2Row) {
+            container.addSeparatorComponents(new SeparatorBuilder());
+            container.addActionRowComponents(cv2Row);
+          }
+          await this.channel.send({
+            components: [container],
+            flags: MessageFlags.IsComponentsV2,
+          });
+          this._markerCardSent = true;
+        }
+      }
+    } catch (err) {
+      log('error', '_extractAndSendMarkers failed', { error: err.message });
+      // Stop 버튼 잔류 방지: 에러 시에도 components 제거
+      try {
+        if (this.currentMessage) {
+          await this.currentMessage.edit({ components: [] });
+        }
+      } catch { /* best effort */ }
+    }
+  }
+
+  /**
+   * Post-finalize: plain text 응답을 Discord Components V2 ContainerBuilder 카드로 래핑.
+   * 스트리밍 중에는 text로 유지, finalize 후 delete+resend 방식.
+   * _extractAndSendMarkers() 이후 호출되므로 currentMessage.content는 마커 제거된 순수 텍스트.
+   *
+   * 래핑 조건 (flash UX 최소화):
+   *   - 500자 미만 + ## 제목 없음 → 스킵 (텍스트 그대로, flash 없음)
+   *   - 마커 카드 전송됐고 남은 텍스트 300자 미만 → 스킵 (마커 카드가 메인 콘텐츠)
+   *
+   * 버튼 조건 (button bloat 방지):
+   *   - 마커 카드 없고 1000자 이상일 때만 부착
+   *
+   * 4000자 제한 대응: 단락(\n\n) → 줄(\n) → 단어 순으로 스마트 분할.
+   * 청크마다 별도 channel.send() (동일 컨테이너 내 다중 TextDisplay는 합산 제한에 걸림).
+   * 버튼은 마지막 청크에만 부착.
+   */
+  async _wrapInCV2() {
+    // 자동 래핑 비활성화 — Discord 응답 평문 markdown 전환 정책 (2026-04-15)
+    // 명시적 CV2_DATA 마커가 있을 때만 CV2 사용. streaming 레이어 자동 래핑 금지.
+    return;
+    if (!this.currentMessage) return;
+    const rawContent = (this.currentMessage.content || '').replace(/ ▌$/, '').trim();
+    if (!rawContent || rawContent === '\u200b' || rawContent.length < 10) return;
+
+    // 래핑 스킵 조건 — flash 유발 최소화
+    const hasHeadings = /^#{1,4} /m.test(rawContent);
+    const isLongContent = rawContent.length >= 500;
+    if (!hasHeadings || !isLongContent) return; // 500자 미만 OR ## 제목 없음 → 텍스트 유지
+
+    // 마커 카드가 이미 있고 남은 텍스트가 짧으면 → 래핑 스킵 (마커 카드가 메인)
+    if (this._markerCardSent && rawContent.length < 300) return;
+
+    // 버튼: 마커 카드 없고 충분히 긴 응답에만 (button bloat 방지)
+    const addButtons = !!(this.sessionKey && !this._markerCardSent && rawContent.length >= 1000);
+
+    try {
+      const chunks = _splitIntoChunks(_preprocessMarkdown(rawContent));
+      const originalMessage = this.currentMessage; // 전송 성공 후 삭제를 위해 참조 보존
+      // CV2 카드 전송 먼저 → 모두 성공하면 원본 삭제 (순서 역전으로 유실 방지)
+      for (let i = 0; i < chunks.length; i++) {
+        const isLast = i === chunks.length - 1;
+        const container = new ContainerBuilder().setAccentColor(0x5865f2); // Discord blurple
+        container.addTextDisplayComponents(new TextDisplayBuilder().setContent(chunks[i]));
+        if (isLast && addButtons) {
+          const plainRow = this._finalActionRow();
+          if (plainRow) {
+            container.addSeparatorComponents(new SeparatorBuilder());
+            container.addActionRowComponents(plainRow);
+          }
+        }
+        const sent = await this.channel.send({
+          components: [container],
+          flags: MessageFlags.IsComponentsV2,
+        });
+        if (isLast) this.currentMessage = sent;
+      }
+      // 모든 CV2 전송 성공 후 원본 삭제 (실패 시 원본 유지됨)
+      try { await originalMessage.delete(); } catch { /* 이미 삭제됐거나 권한 없음 */ }
+    } catch (err) {
+      log('error', '_wrapInCV2 failed', { error: err.message });
+    }
+  }
+}

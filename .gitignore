@@ -1,0 +1,84 @@
+# Environment & Secrets
+.env*
+!.env.example
+
+# Node / JavaScript
+node_modules/
+nodemodules/
+dist/
+build/
+coverage/
+.vite/
+frontend/.vite/
+
+# Python
+__pycache__/
+pycache/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+ENV/
+
+# Logs & Cache
+logs/
+*.log
+cached/
+/cached/
+.cache/
+
+# Artifacts & Temporary Files
+artifacts/
+/artifacts/
+tmp/
+temp/
+
+# IDE & System
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+.serena/
+
+# Runtime & Private Data
+/runtime/*
+!/runtime/.gitkeep
+!/runtime/README.md
+private/
+!private/README.md
+state/
+context/
+board/
+results/
+reports/
+backup/
+watchdog/
+inbox/
+teams/
+experiments/
+vault-starter/
+data/
+*.lance/
+index-state.json
+access-log.json
+rag-errors.jsonl
+write.lock
+*.db
+*.db-shm
+*.db-wal
+*.pem
+
+# Specific private files & secrets
+infra/config/secrets/
+infra/config/user-schedule.json
+infra/config/tasks.json
+infra/config/goals.json
+infra/config/user_profiles.json
+infra/config/channel-map.json
+infra/config/career-targets.json
+.local-backup/
+_archive-*/
+_workspace/

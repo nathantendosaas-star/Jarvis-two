@@ -1,0 +1,209 @@
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
+
+# ═══════════════════════════════════════════════════════════════════════
+# A2 Runtime — ~/jarvis/runtime/ 은 100% private.
+# Git 공식: parent dir 제외 시 하위 negation 불가. 따라서 /runtime/* 로
+# 파일만 exclude + !negation 허용. README.md/.gitkeep만 tracked.
+# ═══════════════════════════════════════════════════════════════════════
+/runtime/*
+!/runtime/.gitkeep
+!/runtime/README.md
+
+# Private data (personal configs, secrets, overrides)
+private/
+!private/README.md
+
+# Local IDE/LSP caches (may contain personal context)
+.serena/
+.vscode/
+.idea/
+
+# RAG data (user-specific)
+*.lance/
+index-state.json
+access-log.json
+rag-errors.jsonl
+write.lock
+
+# Infra runtime data
+infra/config/user-schedule.json
+infra/.env
+infra/discord/node_modules/
+infra/discord/.env
+infra/discord/personas.json
+infra/config/secrets/
+infra/config/tasks.json
+infra/config/goals.json
+infra/config/effective-tasks.json
+
+# Root config — username 노출 방지 (tracked 상태였으나 2026-04-17 제거)
+/config/
+/docker-compose.yml
+/wiki/
+infra/config/company-dna.md
+infra/config/jira.env
+infra/config/tutoring.env
+infra/config/google-calendar-token.json
+infra/config/user_profiles.json
+infra/config/discord-channels.json
+infra/config/discord-mcp.json
+
+# ═══════════════════════════════════════════════════════════════════════
+# Runtime home (통합 후 개인 데이터 보호 — 절대 git에 올라가면 안 됨)
+# ═══════════════════════════════════════════════════════════════════════
+
+# State (세션, 토큰 레저, 에러 로그, 포트폴리오, 봇 PID 등)
+state/
+# Logs (모든 실행 로그)
+logs/
+# Wiki (개인 지식 베이스 — career, family, health, ops 등)
+wiki/
+# Context (대화 이력, 사용자 메모리, Claude 세션)
+context/
+# infra/context/ 는 공유 SSoT (페르소나 등) 추적 허용 — 2026-05-26 negation 추가
+!infra/context/
+!infra/context/**
+# Docker (Langfuse + 크레덴셜)
+docker/
+# Board (Jarvis Board 로컬 인스턴스)
+board/
+# Results (크론 태스크 결과물)
+results/
+# Reports (생성된 리포트)
+reports/
+# Backup (시스템 백업)
+backup/
+# Watchdog (워치독 상태)
+watchdog/
+# Inbox (수신 항목)
+inbox/
+# Teams (팀 상태)
+teams/
+# Experiments
+experiments/
+# Vault
+vault-starter/
+# Tmp
+tmp/
+# Data (런타임 데이터)
+data/
+
+# 개인 설정 (webhook URL, 토큰, API 키)
+*.env
+!*.env.example
+!*.env.test
+# runtime/.env.test 는 실제 시크릿 가능성 — 글로벌 !*.env.test negation 덮어쓰기
+runtime/.env.test
+runtime/discord/.env
+infra/config/monitoring.json
+infra/config/models.json
+config/*.bak*
+infra/discord/*.bak-*
+infra/discord/**/*.bak-*
+infra/scripts/*.bak.*
+infra/scripts/*.bak-*
+*.backup
+
+# JSONL 원장 (토큰, 에러, 커밋먼트 등)
+*.jsonl
+!*.example.jsonl
+
+# Personal scripts (가족 멤버 전용, 개인 설정)
+infra/scripts/boram-*.sh
+infra/scripts/_boram_*.py
+infra/scripts/board-auto-deploy.sh
+infra/scripts/relay-to-owner.sh
+infra/scripts/opensync.py
+infra/scripts/setup_infra.py
+infra/scripts/setup_rag.py
+
+# Runtime
+.jarvis.pid
+jarvis.log
+infra/office/node_modules
+infra/office/dist
+
+# Chrome Extension (오너 개인 프로토타입 — 사이트 목록/파서에 PII 결합)
+# README.md 만 공개 유지, 나머지는 private 관리
+infra/chrome-extension/*
+!infra/chrome-extension/README.md
+
+# Claude Code worktrees
+.claude/worktrees/
+
+# Archive directories (PII 정리 과정에서 이관된 구파일 — 절대 tracked 금지)
+_archive-*/
+
+# interview-fast-path: user-profile 어휘 다수 하드코딩.
+# repo PUBLIC이므로 commit 금지 (Iron Law 4). ~/jarvis/.local-backup/ 매시간 자동 백업.
+infra/discord/lib/interview-fast-path.js
+# interview-verifier-server: SYSTEM_PROMPT few-shot에 user-profile STAR 수치 example 포함.
+infra/scripts/interview-verifier-server.mjs
+# interview-ralph-runner: 질문 풀에 STAR/회사명/PII 식별자 포함.
+infra/scripts/interview-ralph-runner.mjs
+# career-coding-mode: 로컬 전용 코딩 연습 도구 — public repo 제외.
+infra/discord/lib/career-coding-mode.js
+infra/scripts/career-coding-mode.sh
+.local-backup/
+infra/scripts/*.LOCKED.*
+
+# 2026-05-07: Topology Guard 차단 회피 (자동 백업 파일은 commit 제외)
+infra/bin/*.bak-*
+
+# LaunchAgent plist 백업 (사용자 경로 노출 — 로컬 보존만)
+infra/launchagents/
+
+# Owner private context (PII — 특정 기업 등 개인 채용/일정/페르소나 정보)
+# 2026-05-29: public repo PII 누출 차단. .example.md만 추적, 실파일은 로컬 전용.
+infra/context/owner/hot-events.json
+infra/context/owner/follow-ups.json
+infra/context/owner/personal-dates.json
+infra/context/owner/persona.md
+infra/context/owner/preferences.md
+infra/context/owner/visualization.md
+infra/context/owner/persona-discord-emotional.md
+# 2026-06-23: negation !infra/context/** 가 owner .bak 백업까지 추적시키는 구멍 차단.
+# (persona-discord.md.bak 등 백업 파일은 PII 카테고리 — public repo 노출 금지)
+infra/context/**/*.bak-*
+infra/context/**/*.bak.*
+# rag 스크립트 백업 (위생 — infra/scripts/*.bak-* 와 동일 정책을 rag/ 에도 적용)
+rag/scripts/*.bak-*
+rag/bin/*.bak-*
+runtime/state/cli-session-starts.json
+runtime/state/anger-signals.jsonl
+runtime/state/intent-category-vectors.json
+# 코딩테스트 개인 도구 일체 — public repo 노출 금지 (2026-06-12 주인님 지시)
+/Main.java
+infra/bin/ascii-guard.sh
+infra/config/code-routing-config.json
+infra/discord/lib/coding-verify.js
+infra/docs/CODE_ROUTING_COST_ANALYSIS.md
+runtime/state/ralph-forbid-list.json
+
+# 구직·면접 개인정보 일체 — public repo 노출 금지 (2026-07-07 주인님 지시)
+#   지원 회사명·이직 사유·실명 등 PII 포함. Privacy 가드와 이중 방어.
+infra/discord/lib/interviewer-mode.js
+infra/scripts/career-bzpp-search.py
+infra/scripts/career-daily.sh
+infra/scripts/interview-md2html.mjs
+infra/scripts/interview-ralph-start-focused.sh
+infra/scripts/test-context-state-gate.sh
+
+# 개인 채널명 포함 — 공개 저장소 제외 (channel-map.example.json 참조)
+infra/config/channel-map.json
+
+# 메모리 파이프라인 테스트 픽스처 — 검증 질문 자체가 PII
+#   (템플릿: scripts/fixtures/memory-pipeline.example.sh 참조)
+scripts/fixtures/*.local.sh
+
+# 작업 스크래치 — 블로그 초안·A/B 테스트·윤문 원문 등이 쌓인다.
+# 이 저장소는 공개이고 스크래치에는 개인 식별 정보가 섞이므로 추적하지 않는다.
+# 완성된 산출물만 정본 위치로 옮긴다. (2026-08-22 등재)
+_workspace/
+
+# 채용 크롤러 대상 목록 — 어느 회사를 보고 있는지는 개인 구직 정보다.
+# 구조 설명과 예시는 career-targets.example.json (추적 대상) 참조.
+infra/config/career-targets.json

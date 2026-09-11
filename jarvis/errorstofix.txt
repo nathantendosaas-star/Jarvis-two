@@ -1,0 +1,29 @@
+This is to be implemented:
+1. CODING/DEVELOPER AGENT;
+The developer agent should not use the gemini api key or openrouter models either but it should use the google jules api. this means all coding work will be done on github then PR reviewed, merged and a git pull is done. 
+2. RESEARCH AGENT; 
+The research will nolonger be on the emini api but on the open router api. The open router models (deepseek or gemma) will do the research required after gemini api (ceo) has generated a detailed research md doc for the researcher. the researcher then strictly follows the md doc to guide it in doing the research. 
+3. OFFLINE TASKS;
+There is a local model running on the laptop, qwen 2.5 coder 1.5b instruct configured as jarvis-local. When there is not internet access, I will open up a terminal window manually and run ollama serve. What i want is for this local model to work inside jarvis but for very very very simple tasks. all file changes it makes should be first reviewed by the cloud models when online before commmitting to github. there is already a framework the local model was using to run commands, file search, write file. the framework in in the filr python_agent_pro.py. it may need improving to receive http requests from the browser. Plan for how to fix this then create a detailed md for how this will be done that i will hand over to my specialised developer. give them as much gidance info about the task and the reason behind it. i will then give u their output to review and integrate. 
+4. SPAWNING SUB AGENTS;
+Spawning sub agents is still facing some diificulties. When i tell the chat interface to spawn an agent it fails to and i don't see the agent on the agents page. What i want is; I go to chat interface or voice command, tell it to perform a specific task, the main chat agent spawns a necessary sub agent like research, dev, or QA, or if task is not related to any of these, it spawns a sub agennt using the gemini api key but for simple tasks. The agent spawning mechanisim is properly described and detailed in the document antigravity-clone-spec.md . this doc details how to clone the agentic architecture and mechanism of google antigravity 2.0. Reeead that and use it to guide you to fix the agents.
+5. MEMORY PAGE;
+On the memory interface, specifically the  graph, i want every single node to be connected to one another and they should all be connected to the main OS CORE. this should not only be implemented visually but in the actual code. I want all agents and sub agents to know what the other knows thus have access to each other's cache when necessary. Also the search feature on the memory interface does not work so fix that. the search should be able to find eny piece of cached info even if it is inside a file. it should give me the info i'm looking for then provide a summary of it by using the openrouter models (deepseek v4 flash specifically) and reading the cache to come up with a short 5 sentence summary of the search.
+Make it possible to scroll this page
+6. DASHBOARD
+On the dashboard page, my first issue is the milestones section. Everytime I load the dashboard, on the milestones side see some stuff but then it moves downward out of view and I can't see it. I still don't know what it is but please make that stuff stationary. i should also be able to scroll the dashboard page because some parts of the page are out of view so i want to be able to scroll. also on the dashboard page in full screen model, i can't see the chatbox to type in commands for the agent, it is out of view like the other components. also when i click on he notficstions, model they should be able o close if i click any other part of the screen. 
+7. AGENTS;
+On the agents page, under active or idle agents, please remove those graphs the agents have because they slow down the page trying to render the grapghs for usage. so remove the grapghs mabe have live numbers.
+8. BROWSER;
+Under browser, everytime i give it a web link to navigate, it sends a notification sayng 'Web Content for: www.google.com
+
+No browser automation backend is connected for this URL yet.' So i want t to either use web_fetch or DOM to navigate these pages. 
+9. AUTOMATIONS;
+This secton I could say is completely dead. I can't create automations. I want to creat automations in plain english and gemini api creates thenm into working automations. I want to be able to create these automations from the chat agent interface and tthe automations page as well.
+10. SCROLLING;
+Stressing this one more time, make all the pages scrollable.
+
+REFERENCE FILES TALKED ABOUT;
+python_agent_pro.py
+antigravity-clone-spec.md
+qwen 2.5 coder 1.5b instruct (local not committed) under config as jarvis-local

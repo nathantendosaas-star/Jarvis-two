@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# bot-preflight.sh — Discord 봇 시작 전 검증 + AI 자동복구 래퍼
+#
+# 동작 흐름:
+#   1. 설정 파일 검증
+#   2. 실패 시 → tmux(jarvis-heal) 세션에서 ask-claude.sh 실행 → AI가 직접 수정
+#   3. 180초 대기 후 exit 1 → launchd가 재시작 → 다시 검증
+#   4. 통과 시 → 현재 설정 백업 → exec node (프로세스 교체)
+#
+# ═══════════════════════════════════════════════════════════════
+# CONCEPT: SESSION FILES vs CONTEXT TOKENS
+# ═══════════════════════════════════════════════════════════════
+# When this script runs preflight checks and loads config files:
+#
+# SESSION FILES (persistent on disk):
+#   - $BOT_HOME/state/*.md, *.json — configuration state
+#   - $BOT_HOME/logs/preflight.log — persistent diagnostics
+#   - $BOT_HOME/discord/.env — bot credentials and settings
+#   - NOT consumed by Claude API
+#   - Size/count does NOT affect API token usage
+#
+# CONTEXT TOKENS (ephemeral, during Claude calls):
+#   - When ask-claude.sh is invoked for healing
+#   - The error message + config snippets are sent to Claude API
+#   - Claude API tokenizes this input (affects billing)
+#   - Different from "session files" - tokens are discarded after call
+#
+# Design note: We persist config state in session files to avoid
+# re-discovery. When Claude needs to heal, we extract relevant
+# portions and send as context tokens (not the whole file).
+# ═══════════════════════════════════════════════════════════════
+
+set -euo pipefail
+
+BOT_HOME="${BOT_HOME:-${HOME}/jarvis/runtime}"
+BOT_SCRIPT="$BOT_HOME/discord/discord-bot.js"
+ENV_FILE="$BOT_HOME/discord/.env"
+NODE_BIN="${NODE_BIN:-/opt/homebrew/bin/node}"
+LOG_FILE="$BOT_HOME/logs/preflight.log"
+BACKUP_DIR="$BOT_HOME/state/config-backups"
+HEAL_ATTEMPTS_FILE="$BOT_HOME/state/heal-attempts"
+MAX_HEAL_ATTEMPTS=3
+FAST_CRASH_FILE="$BOT_HOME/state/fast-crash-count"
+FAST_CRASH_THRESHOLD=3    # N회 빠른 크래시 시 heal 트리거
+FAST_CRASH_WINDOW_SEC=10  # 기동 후 N초 이내 종료 = 빠른 크래시 (node 시작 오버헤드 + 여유)
+DAILY_HEAL_FILE="$BOT_HOME/state/daily-heal-count"
+DAILY_HEAL_MAX=10          # 24시간 내 heal 최대 횟수 — 무한 tmux 루프 방지
+
+mkdir -p "$BACKUP_DIR"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [preflight] $*" | tee -a "$LOG_FILE"; }
+
+# Shared ntfy function
+source "${BOT_HOME}/lib/ntfy-notify.sh"
+
+# ── Bootstrap early SIGTERM trap (RISK-A) ────────────────────────────────────
+# fail_and_heal() 내 sleep 600/300 구간 SIGTERM 사각지대 방지. node 실행 시점
+# (아래쪽)에 봇 정상 종료용 특화 trap으로 덮어씌워져 이중 안전망 역할.
+_bootstrap_sigterm() {
+    log "SIGTERM/SIGINT 수신 (bootstrap 단계) — 검증/heal 중단, 즉시 종료"
+    rm -f "$BOT_HOME/state/heal-in-progress" 2>/dev/null || true
+    exit 0
+}
+trap _bootstrap_sigterm SIGTERM SIGINT
+
+# 실패: AI 자동복구 세션 시작 → 180초 대기 → exit 1 (launchd 재시작 트리거)
+fail_and_heal() {
+    local reason="$1"
+    log "FAIL: $reason"
+
+    # ── 일일 heal 예산 확인 (RISK-4: 무한 tmux 루프 방지) ────────────────────────
+    local daily_count=0
+    if [[ -f "$DAILY_HEAL_FILE" ]]; then
+        local daily_age
+        daily_age=$(( $(date +%s) - $(stat -f %m "$DAILY_HEAL_FILE" 2>/dev/null || echo 0) ))
+        if (( daily_age < 86400 )); then
+            daily_count=$(cat "$DAILY_HEAL_FILE" 2>/dev/null || echo 0)
+        else
+            rm -f "$DAILY_HEAL_FILE"
+        fi
+    fi
+    if (( daily_count >= DAILY_HEAL_MAX )); then
+        log "CRITICAL: 24시간 heal 예산 소진 (${DAILY_HEAL_MAX}회) — 수동 개입 필요"
+        send_ntfy "Jarvis 봇 heal 예산 소진" "24시간 내 ${DAILY_HEAL_MAX}회 한도 초과. 수동 개입 필요: $reason" "urgent"
+        log "600초 대기 (스팸 방지)..."
+        sleep 600
+        exit 1
+    fi
+    echo $(( daily_count + 1 )) > "$DAILY_HEAL_FILE"
+
+    # ── 복구 시도 횟수 확인 ────────────────────────────────────────────────────
+    local attempts=0
+    if [[ -f "$HEAL_ATTEMPTS_FILE" ]]; then
+        attempts=$(cat "$HEAL_ATTEMPTS_FILE" 2>/dev/null || echo 0)
+    fi
+
+    # 6시간 이상 안정적이었으면 카운터 자동 리셋 (일시적 장애가 영구 차단하지 않게)
+    if [[ -f "$HEAL_ATTEMPTS_FILE" ]]; then
+        last_attempt_age=$(( $(date +%s) - $(stat -f %m "$HEAL_ATTEMPTS_FILE" 2>/dev/null || echo 0) ))
+        if (( last_attempt_age > 21600 )); then
+            log "6시간 이상 경과 — 복구 카운터 자동 리셋 (이전 시도: ${attempts}회)"
+            rm -f "$HEAL_ATTEMPTS_FILE"
+            attempts=0
+        fi
+    fi
+
+    if (( attempts >= MAX_HEAL_ATTEMPTS )); then
+        log "CRITICAL: 복구 시도 ${MAX_HEAL_ATTEMPTS}회 초과 — 수동 개입 필요"
+        send_ntfy "Jarvis 봇 시작 실패" "자동복구 한도 초과 (${MAX_HEAL_ATTEMPTS}회). 수동 개입 필요: $reason" "urgent"
+        log "300초 대기 (launchd 스팸 방지)..."
+        sleep 300
+        exit 1
+    fi
+
+    echo $(( attempts + 1 )) > "$HEAL_ATTEMPTS_FILE"
+    log "복구 시도 $(( attempts + 1 ))/${MAX_HEAL_ATTEMPTS} [일일: $(( daily_count + 1 ))/${DAILY_HEAL_MAX}]"
+
+    # ── Heal 원장 기록 (RISK-B: 파라미터 튜닝 관측 인프라) ────────────────────
+    # JSONL append-only. jq 실패해도 heal 진행은 막지 않음.
+    jq -cn \
+        --arg ts "$(TZ=Asia/Seoul date '+%Y-%m-%dT%H:%M:%S+09:00')" \
+        --arg reason "$reason" \
+        --argjson attempt "$(( attempts + 1 ))" \
+        --argjson daily_count "$(( daily_count + 1 ))" \
+        --argjson daily_max "$DAILY_HEAL_MAX" \
+        --arg host "$(hostname -s)" \
+        '{ts:$ts, reason:$reason, attempt:$attempt, daily_count:$daily_count, daily_max:$daily_max, host:$host}' \
+        >> "$BOT_HOME/state/heal-ledger.jsonl" 2>/dev/null || true
+
+    # ── heal-in-progress 락 확인 (watchdog과의 중복 heal 방지) ────────────────────
+    local heal_lock="$BOT_HOME/state/heal-in-progress"
+    if [[ -f "$heal_lock" ]]; then
+        local lock_age
+        # stat -c '%Y' (Linux/GNU) → 실패 시 stat -f %m (macOS/BSD) 폴백
+        lock_age=$(( $(date +%s) - $(stat -c '%Y' "$heal_lock" 2>/dev/null || stat -f %m "$heal_lock" 2>/dev/null || echo 0) ))
+        if (( lock_age < 600 )); then
+            log "heal 이미 진행 중 (${lock_age}s ago) — 신규 기동 생략, 완료 대기"
+            sleep 30
+            exit 1
+        else
+            log "WARN: 오래된 heal 락 제거 (${lock_age}s) — 재기동 허용"
+            rm -f "$heal_lock"
+        fi
+    fi
+
+    # tmux에서 AI 복구 세션 실행 (PTY 환경 — claude -p 정상 동작 보장)
+    if tmux has-session -t jarvis-heal 2>/dev/null; then
+        log "복구 세션(jarvis-heal) 이미 실행 중 — 완료 대기"
+    else
+        log "복구 세션 시작: tmux jarvis-heal"
+        # HOME/PATH 명시 전달 (tmux는 launchd 환경 미상속, OAuth 인증은 ~/.claude/ 자동 탐색)
+        tmux new-session -d -s jarvis-heal \
+            -e "BOT_HOME=$BOT_HOME" \
+            -e "HOME=$HOME" \
+            -e "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
+            "bash '$BOT_HOME/scripts/bot-heal.sh' $(printf '%q' "$reason")" \
+            2>/dev/null || {
+            # tmux 없는 환경 폴백: ntfy만 발송
+            log "WARN: tmux 없음 — ntfy 알림만 발송"
+            send_ntfy "Jarvis 봇 시작 실패" "수동 개입 필요: $reason" "urgent"
+        }
+    fi
+
+    BACKOFF_DELAYS=(30 90 180)
+    local delay_idx=$(( attempts < ${#BACKOFF_DELAYS[@]} ? attempts : ${#BACKOFF_DELAYS[@]} - 1 ))
+    local sleep_sec="${BACKOFF_DELAYS[$delay_idx]}"
+    log "${sleep_sec}초 대기 후 재시도 (시도 $(( attempts + 1 ))/${MAX_HEAL_ATTEMPTS})..."
+    sleep "$sleep_sec"
+    exit 1
+}
+
+log "=== preflight 검증 시작 ==="
+
+# ── node 바이너리 확인 + smoke test ──────────────────────────────────────────
+if [[ ! -x "$NODE_BIN" ]]; then
+    fail_and_heal "node 없음: $NODE_BIN"
+fi
+if ! "$NODE_BIN" -e "process.exit(0)" 2>/dev/null; then
+    fail_and_heal "node smoke test 실패: $NODE_BIN (바이너리 있지만 실행 불가 — dylib/permission 문제 가능)"
+fi
+
+# ── 봇 스크립트 확인 ──────────────────────────────────────────────────────────
+if [[ ! -f "$BOT_SCRIPT" ]]; then
+    fail_and_heal "discord-bot.js 없음: $BOT_SCRIPT"
+fi
+
+# ── .env 파일 확인 (없으면 백업에서 자동 복원 시도) ────────────────────────────
+if [[ ! -f "$ENV_FILE" ]]; then
+    ENV_BACKUP="$BACKUP_DIR/.env.backup"
+    if [[ -f "$ENV_BACKUP" ]]; then
+        log "WARN: .env 없음 — 백업에서 자동 복원: $ENV_BACKUP"
+        cp "$ENV_BACKUP" "$ENV_FILE"
+        log "✅ .env 백업 복원 완료 ($(wc -l < "$ENV_FILE")줄)"
+        # [ON-DEMAND HOOK] .env 복원 필요했음 — 경고 이벤트
+        "$BOT_HOME/scripts/emit-event.sh" "env.missing" \
+            '{"severity":"restored","source":"preflight"}' >> "$LOG_FILE" 2>&1 || true
+    else
+        # [ON-DEMAND HOOK] .env 없음 + 백업도 없음 — 심각 이벤트
+        "$BOT_HOME/scripts/emit-event.sh" "env.missing" \
+            '{"severity":"critical","source":"preflight"}' >> "$LOG_FILE" 2>&1 || true
+        fail_and_heal ".env 없음 — 백업도 없음. 수동 복구 필요: $ENV_FILE"
+    fi
+fi
+
+# ── .env 필수키 확인 ──────────────────────────────────────────────────────────
+REQUIRED_KEYS=(DISCORD_TOKEN OPENAI_API_KEY CHANNEL_IDS GUILD_ID)
+MISSING_KEYS=()
+for key in "${REQUIRED_KEYS[@]}"; do
+    if ! grep -qE "^${key}=.+" "$ENV_FILE" 2>/dev/null; then
+        MISSING_KEYS+=("$key")
+    fi
+done
+if [[ ${#MISSING_KEYS[@]} -gt 0 ]]; then
+    fail_and_heal ".env 필수키 없거나 비어있음: ${MISSING_KEYS[*]}"
+fi
+
+# ── JSON 유효성 검사 ──────────────────────────────────────────────────────────
+JSON_CONFIGS=(
+    "$BOT_HOME/discord/personas.json"
+    "$BOT_HOME/config/tasks.json"
+)
+for json_file in "${JSON_CONFIGS[@]}"; do
+    [[ -f "$json_file" ]] || continue
+    if ! "$NODE_BIN" -e "JSON.parse(require('fs').readFileSync('$json_file','utf8'))" 2>/dev/null; then
+        fail_and_heal "JSON 파싱 실패: $(basename "$json_file") — 문법 오류로 봇 시작 불가"
+    fi
+done
+
+# ── 검증 통과 → 현재 설정 백업 저장 ──────────────────────────────────────────
+for json_file in "${JSON_CONFIGS[@]}"; do
+    [[ -f "$json_file" ]] || continue
+    cp "$json_file" "$BACKUP_DIR/$(basename "$json_file").backup"
+done
+cp "$ENV_FILE" "$BACKUP_DIR/.env.backup"
+log "백업 저장 완료"
+
+# 검증 통과 → 복구 시도 카운터 리셋
+rm -f "$HEAL_ATTEMPTS_FILE"
+
+log "검증 통과 → 봇 시작 (모니터링 모드)"
+
+# cron-sync: tasks.json ↔ launchd 동기화 (누락된 plist 자동 생성)
+if [[ -x "$BOT_HOME/scripts/cron-sync.sh" ]]; then
+    bash "$BOT_HOME/scripts/cron-sync.sh" >> "$BOT_HOME/logs/cron-sync.log" 2>&1 || true
+    log "cron-sync 완료"
+fi
+
+# node를 백그라운드로 실행 + SIGTERM trap: launchctl stop/daily-restart 수신 시
+# bash가 즉사하여 node가 고아 프로세스로 잔존하는 문제(RISK-2) 방지
+# ── OAuth 격리 (2026-05-30 v2 자동갱신) — 봇 전용 갱신키 credentials로 분리 ──────
+# 봇을 인터랙티브/워크플로(~/.claude)와 다른 OAuth 패밀리로 분리 → reuse-race 유발 주체에서 제외.
+# v2(야간): 정적 long-lived 토큰(갱신키 없음 → 8h 만료 후 수동 재발급)을 버리고,
+#   /login 발급 갱신키 credentials.json + oauth-refresh-bot(30분 선제 갱신)으로 자동갱신.
+#   정적 토큰 사망(05-30 19:34 봇 다운)의 근본 해결. 회사 계정(yuiopnm) OAuth로 격리.
+# Iron Law 4: 토큰을 crontab/plist 평문에 두지 않고 600 credentials.json에서만 읽음.
+_BOT_CONFIG_DIR="$HOME/.claude-bot"
+_BOT_CREDS="$_BOT_CONFIG_DIR/.credentials.json"
+_OAUTH_ISO_FILE="$_BOT_CONFIG_DIR/.long-lived-token"
+if [[ -r "$_BOT_CREDS" ]]; then
+    # [2026-05-31 오염 가드] 봇 credentials가 메인(~/.claude)과 동일 토큰이면 거부 → 장수명 fallback.
+    # 사고(05-31): 봇 토큰 사망 시 메인 credentials를 봇에 복사 → 같은 refresh_token 패밀리 공유 →
+    #   봇 갱신이 메인 refresh_token 무효화 → reuse race로 양쪽 폐기. 디렉토리는 갈렸으나 토큰이 같았음.
+    # 분리 1차 키 = refreshToken(패밀리 식별자). accessToken은 8h마다 회전하므로 보조 비교.
+    # accessToken만 보면 메인 갱신 후 옛 메인 creds 복사 시 가드를 통과(우회)하는 사각지대가 생김.
+    _BOT_AT=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$_BOT_CREDS','utf-8')).claudeAiOauth?.accessToken||'')}catch{}" 2>/dev/null)
+    _MAIN_AT=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$HOME/.claude/.credentials.json','utf-8')).claudeAiOauth?.accessToken||'')}catch{}" 2>/dev/null)
+    _BOT_RT=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$_BOT_CREDS','utf-8')).claudeAiOauth?.refreshToken||'')}catch{}" 2>/dev/null)
+    _MAIN_RT=$(node -e "try{process.stdout.write(JSON.parse(require('fs').readFileSync('$HOME/.claude/.credentials.json','utf-8')).claudeAiOauth?.refreshToken||'')}catch{}" 2>/dev/null)
+    if [[ -r "$_OAUTH_ISO_FILE" ]] && { [[ -n "$_BOT_RT" && "$_BOT_RT" == "$_MAIN_RT" ]] || [[ -n "$_BOT_AT" && "$_BOT_AT" == "$_MAIN_AT" ]]; }; then
+        export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$_OAUTH_ISO_FILE")"
+        log "🔴 오염 감지 — 봇 credentials가 메인과 동일 갱신키/접속키. 거부하고 장수명 토큰 fallback (복사 사고 방지)"
+    else
+        # 갱신키 있는 정상 분리 credentials.json 우선 → CONFIG_DIR 방식(자동갱신 가능).
+        # CLAUDE_CODE_OAUTH_TOKEN env가 있으면 credentials.json보다 우선되므로 명시적 제거.
+        unset CLAUDE_CODE_OAUTH_TOKEN
+        export CLAUDE_CONFIG_DIR="$_BOT_CONFIG_DIR"
+        log "OAuth 격리 — 봇 전용 갱신키 credentials 사용 (CONFIG_DIR=$_BOT_CONFIG_DIR, 자동갱신 활성)"
+    fi
+elif [[ -r "$_OAUTH_ISO_FILE" ]]; then
+    export CLAUDE_CODE_OAUTH_TOKEN="$(cat "$_OAUTH_ISO_FILE")"
+    log "WARN: 갱신키 credentials 없음 — 정적 토큰 fallback (자동갱신 불가, 만료 시 수동 재발급 필요)"
+else
+    log "WARN: 격리 토큰 없음 — 봇이 메인 credentials 사용(격리 미적용)"
+fi
+
+_start_ts=$(date +%s)
+cd "$BOT_HOME/discord" || fail_and_heal "디렉토리 이동 실패: $BOT_HOME/discord"
+export NODE_PATH="/Users/ramsbaby/jarvis/runtime/discord/node_modules${NODE_PATH:+:$NODE_PATH}"
+"$NODE_BIN" discord-bot.js &
+_BOT_PID=$!
+trap 'log "SIGTERM 수신 — 봇 정상 종료 중 (PID $_BOT_PID)..."; kill "$_BOT_PID" 2>/dev/null; wait "$_BOT_PID" 2>/dev/null; exit 0' SIGTERM SIGINT
+wait "$_BOT_PID"
+_exit_code=$?
+trap - SIGTERM SIGINT
+_runtime=$(( $(date +%s) - _start_ts ))
+
+if (( _exit_code != 0 && _runtime < FAST_CRASH_WINDOW_SEC )); then
+    # 빠른 크래시 감지 (SyntaxError, import 실패 등 런타임 즉사)
+    _fast_count=0
+    if [[ -f "$FAST_CRASH_FILE" ]]; then
+        _fast_count=$(cat "$FAST_CRASH_FILE" 2>/dev/null || echo 0)
+    fi
+    _fast_count=$(( _fast_count + 1 ))
+    echo "$_fast_count" > "$FAST_CRASH_FILE"
+    log "빠른 크래시 감지 (runtime=${_runtime}s, exit=${_exit_code}, count=${_fast_count}/${FAST_CRASH_THRESHOLD})"
+
+    if (( _fast_count >= FAST_CRASH_THRESHOLD )); then
+        rm -f "$FAST_CRASH_FILE"
+        _last_err=$(tail -30 "$BOT_HOME/logs/discord-bot.err.log" 2>/dev/null \
+            | grep -iE "Error:|SyntaxError|TypeError|Cannot find|ENOENT" \
+            | tail -1 || echo "알 수 없음")
+        fail_and_heal "빠른 크래시 ${_fast_count}회 반복 (runtime<${FAST_CRASH_WINDOW_SEC}s): ${_last_err}"
+    fi
+else
+    # 정상 실행(오래 돌았거나 정상 종료) → 빠른 크래시 카운터 리셋
+    if [[ -f "$FAST_CRASH_FILE" ]]; then
+        log "정상 실행 후 종료 (runtime=${_runtime}s) → fast-crash 카운터 리셋"
+        rm -f "$FAST_CRASH_FILE"
+    fi
+fi
+
+exit $_exit_code

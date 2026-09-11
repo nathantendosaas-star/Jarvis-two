@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Privacy Guard + Topology Guard pre-commit hook (Phase 2 + 3)
+# scripts/privacy/scan.mjs 를 호출.
+#
+# Phase 2 변경점 (2026-04-20):
+#   - PRIVACY_BYPASS_REASON 은 이제 medium/low 위반만 우회 가능.
+#   - critical/high 위반이 감지되면 BYPASS 무시 → 무조건 exit 1.
+#   - 이유: high 등급 리터럴(이메일·회사명·실명 등)은 "긴급 예외" 이유로도
+#     저장소에 올려서는 안 되는 설계 원칙. 반드시 private/ 분리 또는 env 사용.
+#
+# Phase 3 변경점 (2026-04-21):
+#   - Topology Guard 추가: 신규 코드에서 ~/.jarvis/ 절대경로 사용 차단.
+#   - 정당한 잔존(README 호환 안내, ADR, 마이그레이션 스크립트)은 ALLOWLIST.
+#   - 라인별 우회는 # ALLOW-DOTJARVIS 마커.
+#
+# 이전 버전(secret 패턴 in-line grep)은 git history 에서 참조:
+#   git log -p -- .githooks/pre-commit
+# Secret 탐지는 .gitleaks.toml + CI(pii-scan.yml)가 담당.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+
+# ─── Personal Path Guard: 개인용 파일 커밋 차단 (2026-06-12) ─────────
+# 패턴 목록은 gitignored private 파일에 보관 — 파일 부재 시 자동 skip (OSS 배포판 영향 0).
+# 사고 이력: 2026-06-11 개인 기능 공개 커밋(6f116e8). 우회: JARVIS_PERSONAL_OK=1 (주인님 명시 승인 시만).
+PERSONAL_BLOCKLIST="$ROOT/private/config/personal-path-blocklist.txt"
+if [[ -f "$PERSONAL_BLOCKLIST" && "${JARVIS_PERSONAL_OK:-0}" != "1" ]]; then
+  personal_hits=$(git diff --cached --name-only | grep -E -f "$PERSONAL_BLOCKLIST" || true)
+  if [[ -n "$personal_hits" ]]; then
+    echo "🚫 [pre-commit] 개인용 파일이 스테이징에 포함되어 커밋을 차단합니다:" >&2
+    echo "$personal_hits" | sed 's/^/   - /' >&2
+    echo "   해제: git restore --staged <파일> / 의도된 커밋이면 JARVIS_PERSONAL_OK=1 prefix" >&2
+    exit 1
+  fi
+fi
+
+# ─── Topology Guard: ~/.jarvis/ 신규 유입 차단 ──────────────────────
+# SSoT: ~/jarvis/runtime/ (~/.jarvis 는 호환 심링크, 2026-10-17 만료 예정)
+TOPOLOGY_ALLOWLIST='^(infra/adr/|README\.(ko\.)?md$|infra/CLAUDE-SETUP-GUIDE\.md|infra/README-infra\.md|infra/\.env\.example|infra/lib/(compat|jarvis-paths)\.sh|infra/scripts/(upgrade-v2|migrate-to-runtime|symlink-topology-audit|backup-retention|board-watchdog|tasks-prompt-path-audit)\.(sh|mjs)|infra/scripts/A2-MIGRATION\.md|infra/docs/(A2-MIGRATION|API|CONFIG|EXAMPLES|INSTALL|INSTALL\.en|DEPENDENCY-ANALYSIS|ARCHITECTURE)\.md|infra/discord/lib/(orchestrator\.mjs|streaming\.js)|infra/templates/crontab\.example|infra/prompts/memory-expire\.md|rag/lib/rag-engine\.mjs|docs/promo/awesome-claude-code-submission\.md|\.claude/skills/onboarding/SKILL\.md|^discord/discord-bot\.js$|\.githooks/pre-commit$|dotfiles/)'
+
+topology_violations=""
+while IFS= read -r file; do
+  [[ -n "$file" ]] || continue
+  [[ -f "$ROOT/$file" ]] || continue
+  if echo "$file" | grep -qE "$TOPOLOGY_ALLOWLIST"; then continue; fi
+  # 신규로 추가된 라인(`+`로 시작, 헤더 `+++` 제외) 중 /.jarvis/ 포함하면서
+  # ALLOW-DOTJARVIS 마커가 없는 것
+  new_lines=$(git diff --cached -U0 -- "$file" 2>/dev/null | grep -E '^\+[^+]' | grep -E '/\.jarvis/' | grep -v 'ALLOW-DOTJARVIS' || true)
+  if [[ -n "$new_lines" ]]; then
+    topology_violations+="--- $file ---"$'\n'"$new_lines"$'\n'
+  fi
+done < <(git diff --cached --name-only --diff-filter=ACM)
+
+if [[ -n "$topology_violations" ]]; then
+  echo "🚨 Topology Guard: ~/.jarvis/ 절대경로 신규 유입 감지" >&2
+  echo "" >&2
+  echo "$topology_violations" >&2
+  echo "" >&2
+  echo "  해결 방법:" >&2
+  echo "    1. ~/.jarvis/ → ~/jarvis/runtime/ 로 변경 (SSoT 표기)" >&2
+  echo "    2. 의도적 잔존이면 라인 끝에 '# ALLOW-DOTJARVIS' 마커 추가" >&2
+  echo "    3. 호환 문서/마이그레이션 스크립트면 TOPOLOGY_ALLOWLIST 에 추가" >&2
+  exit 1
+fi
+
+# ─── Interview Bot SSoT Guard ────────────────────────────────────────────────
+# interview-harness-audit.mjs 가 staged 에 있는데 INTERVIEW-BOT.md 가 빠졌으면 경고.
+# 참고: fast-path.js·ralph-runner.mjs 는 gitignored → staged 불가.
+#       코드 버전 drift 는 harness C6 (weekly) 가 보완.
+_staged=$(git diff --cached --name-only --diff-filter=ACM 2>/dev/null || true)
+if echo "$_staged" | grep -q 'interview-harness-audit\.mjs'; then
+  if ! echo "$_staged" | grep -q 'infra/docs/INTERVIEW-BOT\.md'; then
+    echo "⚠️  [Interview SSoT] interview-harness-audit.mjs 변경 감지 — INTERVIEW-BOT.md 가 staged 에 없습니다." >&2
+    echo "   설계 변경이면 infra/docs/INTERVIEW-BOT.md 도 함께 업데이트해 주십시오." >&2
+    echo "   (경고만 — 커밋은 계속 진행됩니다)" >&2
+  fi
+fi
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "⚠️  node 없음 — privacy scan skip (경고만)" >&2
+  exit 0
+fi
+
+if [ -n "${PRIVACY_BYPASS_REASON:-}" ]; then
+  # bypass 요청 들어와도 먼저 scan 돌려서 high/critical 있는지 확인.
+  set +e
+  scan_out=$(node "$ROOT/scripts/privacy/scan.mjs" --staged 2>&1)
+  rc=$?
+  set -e
+
+  if [ "$rc" -ne 0 ]; then
+    # 위반 존재 — severity 등급 판단
+    if echo "$scan_out" | grep -qE '\[(critical|high)/'; then
+      echo "$scan_out" >&2
+      echo "" >&2
+      echo "🚨 BYPASS 거부 — critical/high 등급 위반은 PRIVACY_BYPASS_REASON 우회 불가" >&2
+      echo "   bypass reason: $PRIVACY_BYPASS_REASON" >&2
+      echo "" >&2
+      echo "   해결 방법:" >&2
+      echo "     1. 민감 리터럴을 private/config/*.json (gitignored) 으로 분리" >&2
+      echo "     2. 런타임에 readFileSync 로 로드 + graceful fallback 구현" >&2
+      echo "     3. 블록리스트 룰 확장이 필요하면 .privacy-blocklist.yml 수정" >&2
+      exit 1
+    fi
+    # medium/low 만 존재 — bypass 허용
+    echo "$scan_out" >&2
+    echo "⚠️  Privacy scan bypassed (medium/low only): $PRIVACY_BYPASS_REASON" >&2
+    # TODO Phase 3: ledger 기록 (~/jarvis/runtime/logs/privacy-bypass.jsonl)
+    exit 0
+  fi
+  # 위반 없음에도 bypass 사용됨 — 경고만 하고 통과
+  echo "⚠️  Privacy scan bypassed (no violations): $PRIVACY_BYPASS_REASON" >&2
+  exit 0
+fi
+
+node "$ROOT/scripts/privacy/scan.mjs" --staged

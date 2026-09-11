@@ -1,0 +1,617 @@
+#!/usr/bin/env node
+/**
+ * interview-harness-audit.mjs — 면접봇 하네스 독립 감사관
+ *
+ * 목적: 실행 경로 내부 가드(schema guard 등)가 잡지 못하는
+ *       데이터 무결성 문제를 외부에서 독립적으로 검증한다.
+ *
+ * Karpathy 원칙: "The eval must be independent of the thing being evaluated."
+ * 내부 가드(fast-path 안)는 fast-path가 망가지면 같이 망가진다.
+ * 이 스크립트는 면접봇과 완전히 분리된 독립 감사 루프다.
+ *
+ * 검사 항목:
+ *   C1. instantRiskQuestions ↔ qnaQuestions.id 교차 참조 무결성
+ *   C2. insights.jsonl EVAL_ERROR 오염률
+ *   C3. 동적 질문 vs 베이스 질문 점수 역전 여부
+ *   C4. forbid list 패턴 품질 (너무 짧음 / 비면접 오염)
+ *   C5. rounds.jsonl 구조 무결성
+ *   C6. 기획 문서 존재·버전 정합성 (INTERVIEW-BOT.md ↔ 코드 버전 태그)
+ *   C7. EvalContext SSoT 정합성 — 생성(fast-path answerGuide)·채점(verifier) 컨텍스트 일치 여부
+ *       근본 원인(2026-04-30): callMetaAnalyze가 answerGuide를 verifier에 미전달
+ *       → answerGuide 기반 답변이 ssotScore 감점 → Ralph 학습이 역방향 누적
+ *
+ * 사용:
+ *   node interview-harness-audit.mjs           # 조용한 모드 (이상 시만 출력)
+ *   node interview-harness-audit.mjs --verbose  # 전체 출력
+ *   node interview-harness-audit.mjs --notify   # Discord 전송
+ *   node interview-harness-audit.mjs --fix      # 자동 수정 가능한 항목 수정
+ *
+ * 마이그레이션 후 자동 실행 권장:
+ *   npm run migration && node interview-harness-audit.mjs --notify
+ *
+ * 2026-04-30 신설 — 2026-04-28 v9.2 마이그레이션 이후 instantRiskQuestions
+ *   ID 불일치 2일간 미감지 사고의 재발 방지 구조.
+ */
+
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
+
+const VERBOSE  = process.argv.includes('--verbose');
+const NOTIFY   = process.argv.includes('--notify');
+const FIX_MODE = process.argv.includes('--fix');
+
+const HOME     = homedir();
+const SCN_PATH = join(HOME, 'jarvis/runtime/state/scenarios/samsung-cnt.json');
+const INSIGHTS = join(HOME, 'jarvis/runtime/state/ralph-insights.jsonl');
+const FORBID   = join(HOME, 'jarvis/runtime/state/ralph-forbid-list.json');
+const ROUNDS   = join(HOME, 'jarvis/runtime/state/ralph-rounds.jsonl');
+const DOC_PATH = join(HOME, 'jarvis/infra/docs/INTERVIEW-BOT.md');
+const PROF_PATH = join(HOME, 'jarvis/runtime/context/interview-bot-profile.md');
+// P5 fix: JSON.parse(URL문자열) → SyntaxError → null 버그 수정. 단순 문자열 추출로 변경.
+const WEBHOOK  = process.env.DISCORD_INTERVIEW_WEBHOOK ||
+                 (() => { try {
+                   const line = readFileSync(join(HOME, 'jarvis/runtime/.env'), 'utf-8')
+                     .split('\n').find(l => l.startsWith('DISCORD_WEBHOOK_INTERVIEW='));
+                   return line ? line.split('=').slice(1).join('=').trim() : null;
+                 } catch { return null; } })();
+
+// ─── 유틸 ────────────────────────────────────────────────────────────────────
+let passCount = 0;
+let failCount = 0;
+const failures = [];
+
+function pass(code, msg) {
+  passCount++;
+  if (VERBOSE) console.log(`  ✅ [${code}] ${msg}`);
+}
+function fail(code, msg, detail = '') {
+  failCount++;
+  failures.push({ code, msg, detail });
+  console.log(`  ❌ [${code}] ${msg}`);
+  if (detail && VERBOSE) console.log(`       ${detail}`);
+}
+function warn(code, msg) {
+  console.log(`  ⚠️  [${code}] ${msg}`);
+}
+
+async function postWebhook(text) {
+  if (!WEBHOOK || !NOTIFY) return;
+  try {
+    await fetch(WEBHOOK, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text.slice(0, 1900) }),
+    });
+  } catch { /* Discord 실패해도 감사 계속 */ }
+}
+
+// ─── C1: instantRiskQuestions ↔ qnaQuestions.id 교차 참조 무결성 ────────────
+function checkC1(scn) {
+  console.log('\n[C1] instantRiskQuestions ↔ qnaQuestions.id 교차 참조');
+  const irq = scn.instantRiskQuestions || [];
+  const qnaIds = new Set((scn.qnaQuestions || []).map(q => q.id));
+
+  if (irq.length === 0) {
+    warn('C1', 'instantRiskQuestions 배열 비어 있음 — 즉답 위험 우선순위 비활성');
+    return;
+  }
+
+  const matched   = irq.filter(id => qnaIds.has(id));
+  const unmatched = irq.filter(id => !qnaIds.has(id));
+
+  if (unmatched.length === 0) {
+    pass('C1', `instantRiskQuestions ${irq.length}개 전원 qnaQuestions ID 일치`);
+  } else {
+    fail(
+      'C1',
+      `instantRiskQuestions ${unmatched.length}/${irq.length}개 ID 불일치 — 즉답 위험 우선순위 무효`,
+      `불일치: ${unmatched.slice(0, 5).join(', ')}... | 예시 qnaId: ${[...qnaIds].slice(0, 3).join(', ')}`,
+    );
+
+    // --fix 모드: isInstantRisk=true 항목에서 올바른 ID 추출하여 배열 갱신
+    if (FIX_MODE) {
+      const correctIds = (scn.qnaQuestions || [])
+        .filter(q => q.isInstantRisk === true)
+        .map(q => q.id);
+      if (correctIds.length > 0) {
+        scn.instantRiskQuestions = correctIds;
+        console.log(`     🔧 --fix: instantRiskQuestions → ${correctIds.length}개 (isInstantRisk=true 기반)`);
+        console.log(`        ${correctIds.slice(0, 5).join(', ')}...`);
+        return { fixed: true, scn };
+      }
+    }
+  }
+
+  // isInstantRisk=true 항목 수와 배열 수 불일치 경고
+  const boolTrue = (scn.qnaQuestions || []).filter(q => q.isInstantRisk === true).length;
+  if (boolTrue !== irq.length) {
+    warn('C1', `isInstantRisk=true ${boolTrue}개 vs instantRiskQuestions 배열 ${irq.length}개 불일치 — 코드가 boolean 기준으로 동작 중`);
+  }
+}
+
+// ─── C2: insights.jsonl EVAL_ERROR 오염률 ────────────────────────────────────
+function checkC2() {
+  console.log('\n[C2] insights.jsonl EVAL_ERROR 오염률');
+  if (!existsSync(INSIGHTS)) {
+    warn('C2', 'insights.jsonl 없음 — 첫 라운드 전');
+    return;
+  }
+
+  const lines = readFileSync(INSIGHTS, 'utf-8').split('\n').filter(Boolean);
+  const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+
+  const total    = entries.length;
+  const errCount = entries.filter(e => e.evalError === true || e.verdict === 'EVAL_ERROR').length;
+  const zeroScoreNoFlag = entries.filter(e =>
+    e.overallScore === 0 && e.verdict === 'FAIL' &&
+    e.evalError !== true && e.verdict !== 'EVAL_ERROR',
+  ).length;
+
+  const rate = total > 0 ? (errCount / total * 100).toFixed(1) : '0.0';
+
+  if (errCount === 0 && zeroScoreNoFlag === 0) {
+    pass('C2', `insights.jsonl ${total}건 — EVAL_ERROR 없음`);
+  } else {
+    if (errCount > 0) {
+      pass('C2-a', `EVAL_ERROR ${errCount}건 (${rate}%) 플래그 격리 정상 — 집계에서 제외됨`);
+    }
+    if (zeroScoreNoFlag > 0) {
+      fail(
+        'C2-b',
+        `score=0 + verdict=FAIL (플래그 없음) ${zeroScoreNoFlag}건 — 구버전 오염 데이터 의심`,
+        `이 항목들은 v4.57 이전에 생성된 parse 실패 잔재일 수 있음. --fix로 플래그 부여 가능.`,
+      );
+    }
+  }
+
+  if (VERBOSE) {
+    console.log(`     총 ${total}건: EVAL_ERROR=${errCount} | 레거시 0점=${zeroScoreNoFlag} | 정상=${total - errCount - zeroScoreNoFlag}`);
+  }
+  return { total, errCount, zeroScoreNoFlag };
+}
+
+// ─── C3: 동적 질문 vs 베이스 질문 점수 역전 ─────────────────────────────────
+function checkC3() {
+  console.log('\n[C3] 동적 질문 vs 베이스 질문 점수 역전 (약점 노출 효과)');
+  if (!existsSync(INSIGHTS)) {
+    warn('C3', 'insights.jsonl 없음');
+    return;
+  }
+
+  const lines = readFileSync(INSIGHTS, 'utf-8').split('\n').filter(Boolean);
+  const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  const valid = entries.filter(e => e.evalError !== true && e.verdict !== 'EVAL_ERROR');
+
+  const dynScores  = valid.filter(e => e.qid?.startsWith('q-dyn-') && typeof e.overallScore === 'number' && e.overallScore > 0);
+  const baseScores = valid.filter(e => e.qid?.startsWith('q-star') && typeof e.overallScore === 'number' && e.overallScore > 0);
+
+  if (dynScores.length < 5 || baseScores.length < 5) {
+    warn('C3', `데이터 부족 — DYN ${dynScores.length}건, BASE ${baseScores.length}건 (최소 5건 필요)`);
+    return;
+  }
+
+  const dynAvg  = dynScores.reduce((s, e) => s + e.overallScore, 0) / dynScores.length;
+  const baseAvg = baseScores.reduce((s, e) => s + e.overallScore, 0) / baseScores.length;
+  const diff    = dynAvg - baseAvg;
+
+  if (VERBOSE) {
+    console.log(`     DYN  평균: ${dynAvg.toFixed(2)} (${dynScores.length}건)`);
+    console.log(`     BASE 평균: ${baseAvg.toFixed(2)} (${baseScores.length}건)`);
+    console.log(`     차이: ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}점`);
+  }
+
+  if (Math.abs(diff) < 0.3) {
+    pass('C3', `동적/베이스 난이도 유사 (차이 ${diff >= 0 ? '+' : ''}${diff.toFixed(2)}점)`);
+  } else if (diff < 0) {
+    pass('C3', `동적 질문이 더 어려움 (차이 ${diff.toFixed(2)}점) — 약점 노출 성공`);
+  } else {
+    fail(
+      'C3',
+      `동적 질문 역전 — DYN ${dynAvg.toFixed(2)} > BASE ${baseAvg.toFixed(2)} (차이 +${diff.toFixed(2)}점)`,
+      '동적 질문 캐시 삭제 후 LLM 재생성 권장. ralph 재가동 시 자동 처리됨.',
+    );
+  }
+
+  return { dynAvg, baseAvg, diff };
+}
+
+// ─── C4: forbid list 패턴 품질 ───────────────────────────────────────────────
+function checkC4() {
+  console.log('\n[C4] forbid list 패턴 품질');
+  if (!existsSync(FORBID)) {
+    warn('C4', 'ralph-forbid-list.json 없음');
+    return;
+  }
+
+  const { forbidPatterns = [] } = JSON.parse(readFileSync(FORBID, 'utf-8'));
+
+  // 중복 검사
+  const seen = new Set();
+  const dupes = [];
+  for (const p of forbidPatterns) {
+    if (seen.has(p)) dupes.push(p);
+    seen.add(p);
+  }
+
+  // 비면접 오염 키워드 (k8s/IaC)
+  const CONTAM_KW = ['helm', 'k8s', 'kubernetes', 'kubectl', 'terraform', 'argocd', 'dockerfile', 'ansible'];
+  const contaminated = forbidPatterns.filter(p =>
+    CONTAM_KW.some(kw => p.toLowerCase().includes(kw)),
+  );
+
+  if (dupes.length === 0) {
+    pass('C4-dup', `forbid list 중복 없음 (${forbidPatterns.length}개)`);
+  } else {
+    fail('C4-dup', `forbid list 중복 ${dupes.length}개`, dupes.join(', '));
+  }
+
+  if (contaminated.length === 0) {
+    pass('C4-contam', 'forbid list 비면접(k8s/IaC) 오염 없음');
+  } else {
+    fail('C4-contam', `forbid list 비면접 오염 ${contaminated.length}개`, contaminated.join(', '));
+  }
+}
+
+// ─── C5: rounds.jsonl 구조 무결성 ────────────────────────────────────────────
+function checkC5() {
+  console.log('\n[C5] rounds.jsonl 구조 무결성');
+  if (!existsSync(ROUNDS)) {
+    warn('C5', 'ralph-rounds.jsonl 없음');
+    return;
+  }
+
+  const lines = readFileSync(ROUNDS, 'utf-8').split('\n').filter(Boolean);
+  let parseErrs = 0;
+  let missingTs  = 0;
+  let allSkip    = 0;
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (!obj.ts) missingTs++;
+      const results = obj.results || [];
+      if (results.length > 0 && results.every(r => r.skipped === true)) {
+        allSkip++;
+      }
+    } catch {
+      parseErrs++;
+    }
+  }
+
+  if (parseErrs === 0) {
+    pass('C5-json', `rounds.jsonl ${lines.length}개 라운드 JSON 파싱 성공`);
+  } else {
+    fail('C5-json', `rounds.jsonl ${parseErrs}개 parse 오류`);
+  }
+
+  if (missingTs === 0) {
+    pass('C5-ts', 'rounds.jsonl 타임스탬프 전원 존재');
+  } else {
+    fail('C5-ts', `rounds.jsonl ts 필드 누락 ${missingTs}건`);
+  }
+
+  if (allSkip > 0) {
+    warn('C5-skip', `전량 SKIP 라운드 ${allSkip}건 — daily cap 또는 circuit breaker 흔적`);
+  }
+}
+
+// ─── C6: 기획 문서 존재·버전 정합성 ─────────────────────────────────────────
+function checkC6() {
+  console.log('\n[C6] 기획 문서 존재·버전 정합성');
+
+  // C6-a: INTERVIEW-BOT.md 존재 확인
+  if (!existsSync(DOC_PATH)) {
+    fail('C6-doc', 'INTERVIEW-BOT.md 없음 — infra/docs/INTERVIEW-BOT.md 생성 필요');
+  } else {
+    pass('C6-doc', 'INTERVIEW-BOT.md 존재 확인');
+  }
+
+  // C6-b: interview-bot-profile.md 존재 확인
+  if (!existsSync(PROF_PATH)) {
+    fail('C6-profile', 'interview-bot-profile.md 없음 — runtime/context/interview-bot-profile.md 생성 필요');
+  } else {
+    pass('C6-profile', 'interview-bot-profile.md 존재 확인');
+  }
+
+  // C6-c: 기획 문서의 버전 태그와 실제 코드 최신 버전 비교
+  if (existsSync(DOC_PATH)) {
+    const docContent = readFileSync(DOC_PATH, 'utf-8');
+    const docVerMatch = docContent.match(/현재 버전:\s*(v[\d.]+)/);
+    const docVer = docVerMatch ? docVerMatch[1] : null;
+
+    const runnerPath = join(homedir(), 'jarvis/infra/scripts/interview-ralph-runner.mjs');
+    const fastPath   = join(homedir(), 'jarvis/infra/discord/lib/interview-fast-path.js');
+
+    // 버전 비교: parseFloat 금지 (v4.9 > v4.66 오판 발생).
+    // "4.66" → [4, 66], "4.9" → [4, 9] 로 쪼개 정수 비교.
+    const parseVer = v => v.split('.').map(Number);
+    const cmpVer   = (a, b) => {
+      const [aMaj, aMin] = parseVer(a);
+      const [bMaj, bMin] = parseVer(b);
+      if (aMaj !== bMaj) return bMaj - aMaj;
+      return bMin - aMin;
+    };
+
+    let codeVer = null;
+    for (const p of [runnerPath, fastPath]) {
+      if (!existsSync(p)) continue;
+      const src = readFileSync(p, 'utf-8');
+      // 2026-06-23 버그 수정: major 버전 4만 매칭하던 정규식(`v4.\d+`)이 v5.X 코드 태그를 못 봐
+      // codeVer를 v4.99로 오보 → 실제 v5.5인데 문서 불일치 오판. major를 \d+로 일반화(v6+ 대비).
+      const versions = [...src.matchAll(/\/\/ v(\d+\.\d+)/g)].map(m => m[1]);
+      if (versions.length > 0) {
+        const latest = versions.sort(cmpVer)[0];
+        if (!codeVer || cmpVer(latest, codeVer.replace('v', '')) < 0) {
+          codeVer = `v${latest}`;
+        }
+      }
+    }
+
+    if (!docVer) {
+      warn('C6-ver', '기획 문서에 "현재 버전: vX.XX" 항목 없음 — 문서 갱신 필요');
+    } else if (!codeVer) {
+      // P1 fix: codeVer=null(파일 없거나 버전 태그 0개)이면 silent PASS 금지
+      warn('C6-ver', '코드에서 버전 태그(// v4.XX) 감지 불가 — ralph-runner/fast-path 경로 확인 필요');
+    } else if (docVer !== codeVer) {
+      fail('C6-ver',
+        `기획 문서 버전(${docVer}) ≠ 코드 최신 버전(${codeVer}) — INTERVIEW-BOT.md 갱신 필요`,
+        `문서: ${docVer} / 코드: ${codeVer}`
+      );
+    } else {
+      pass('C6-ver', `버전 정합 확인 (${docVer})`);
+    }
+  }
+}
+
+// ─── C7: EvalContext SSoT 정합성 — answerGuide 전달 체인 감사 ────────────────
+// 근본 원인(2026-04-30): callMetaAnalyze가 answerGuide를 verifier에 미전달
+// → fast-path가 answerGuide(RF=3 등)로 생성한 답변을 verifier가 ssotScore 감점
+// → Ralph 학습 신호가 "answerGuide 내용 쓰지 마라"로 역방향 누적
+// 수정(v4.71/v1.5): answerGuide를 verifier로 전달 → 허용 SSoT로 인정 → 공정 평가
+//
+// 이 감사는 수정이 무언가에 의해 되돌려지는 상황(회귀)을 방어한다.
+// 코드 패턴 6개를 모두 만족해야 PASS — 하나라도 빠지면 즉시 역방향 학습 재발.
+function checkC7() {
+  console.log('\n[C7] EvalContext SSoT 정합성 — answerGuide 전달 체인 (6-gate)');
+
+  const RUNNER_PATH   = join(HOME, 'jarvis/infra/scripts/interview-ralph-runner.mjs');
+  const VERIFIER_PATH = join(HOME, 'jarvis/infra/scripts/interview-verifier-server.mjs');
+
+  if (!existsSync(RUNNER_PATH)) {
+    fail('C7', 'interview-ralph-runner.mjs 없음 — 감사 불가');
+    return;
+  }
+  if (!existsSync(VERIFIER_PATH)) {
+    fail('C7', 'interview-verifier-server.mjs 없음 — 감사 불가');
+    return;
+  }
+
+  const runnerSrc   = readFileSync(RUNNER_PATH, 'utf-8');
+  const verifierSrc = readFileSync(VERIFIER_PATH, 'utf-8');
+
+  // Gate 1: callMetaAnalyze 시그니처에 answerGuide 파라미터 포함
+  const gate1 = /async function callMetaAnalyze\([^)]*answerGuide/.test(runnerSrc);
+  if (gate1) {
+    pass('C7-1', 'callMetaAnalyze 시그니처에 answerGuide 파라미터 존재');
+  } else {
+    fail(
+      'C7-1',
+      'callMetaAnalyze 시그니처에 answerGuide 파라미터 누락 — verifier 미전달 근본 원인 재발',
+      '수정: async function callMetaAnalyze(..., answerGuide = \'\') 형태여야 함',
+    );
+  }
+
+  // Gate 2: callMetaAnalyze 함수 본문 내 JSON.stringify body에 answerGuide 포함
+  // v2: 함수 본문 스코프로 한정 (파일 전체 매칭 → false-negative 방어)
+  // 이전 regex /JSON\.stringify\(\s*\{[^}]*answerGuide/의 [^}]* 는 } 한 개에서 멈춰
+  //   다중 라인 body나 파일 다른 JSON.stringify와 혼동 가능. callMetaAnalyze 본문만 추출 후 검사.
+  const callMetaFnMatch = runnerSrc.match(/async function callMetaAnalyze\b[\s\S]*?\n\}/);
+  const callMetaFnBody = callMetaFnMatch ? callMetaFnMatch[0] : '';
+  const gate2 = callMetaFnBody.length > 0 &&
+                callMetaFnBody.includes('JSON.stringify') &&
+                callMetaFnBody.includes('answerGuide');
+  if (gate2) {
+    pass('C7-2', 'callMetaAnalyze 함수 본문 내 JSON.stringify + answerGuide 확인 (함수 스코프 한정)');
+  } else {
+    fail(
+      'C7-2',
+      'callMetaAnalyze 함수 본문에 JSON.stringify(answerGuide) 누락 — verifier가 answerGuide를 수신하지 못함',
+      '수정: body: JSON.stringify({ ..., answerGuide }) 형태여야 함 / callMetaAnalyze 함수 본문 확인 필요',
+    );
+  }
+
+  // Gate 3: callMetaAnalyze 호출 지점에서 q.answerGuide 전달
+  // ralph-runner processQuestion 루프에서 q.answerGuide || '' 전달 확인
+  const gate3 = /callMetaAnalyze\([^)]*q\.answerGuide/.test(runnerSrc);
+  if (gate3) {
+    pass('C7-3', 'callMetaAnalyze 호출 지점 — q.answerGuide 전달 확인');
+  } else {
+    fail(
+      'C7-3',
+      'callMetaAnalyze 호출 시 q.answerGuide 미전달 — 시나리오 PDF 가이드가 채점에 반영 안 됨',
+      '수정: meta = await callMetaAnalyze(q.text, shortText, detailText, q.star, q.answerGuide || \'\') 형태여야 함',
+    );
+  }
+
+  // Gate 4: verifier /meta-analyze 엔드포인트에서 answerGuide destructure
+  // JSON.parse(body)에서 answerGuide 추출 확인
+  const gate4 = /const\s*\{[^}]*answerGuide[^}]*\}\s*=\s*JSON\.parse\(body\)/.test(verifierSrc);
+  if (gate4) {
+    pass('C7-4', 'verifier /meta-analyze — answerGuide destructure 확인');
+  } else {
+    fail(
+      'C7-4',
+      'verifier /meta-analyze에서 answerGuide destructure 누락 — 전달돼도 undefined로 무시됨',
+      '수정: const { ..., answerGuide } = JSON.parse(body) 형태여야 함',
+    );
+  }
+
+  // Gate 5: callClaudeMetaAnalyze 시그니처에 answerGuide 파라미터
+  const gate5 = /async function callClaudeMetaAnalyze\([^)]*answerGuide/.test(verifierSrc);
+  if (gate5) {
+    pass('C7-5', 'callClaudeMetaAnalyze 시그니처에 answerGuide 파라미터 존재');
+  } else {
+    fail(
+      'C7-5',
+      'callClaudeMetaAnalyze 시그니처에 answerGuide 파라미터 누락 — 채점 프롬프트에 주입 불가',
+      '수정: async function callClaudeMetaAnalyze(..., answerGuide = \'\') 형태여야 함',
+    );
+  }
+
+  // Gate 6: 채점 프롬프트에 answerGuideBlock 주입 — user-profile.md 이후 answerGuide 블록 삽입
+  // "answerGuideBlock" 변수 정의와 프롬프트에 ${answerGuideBlock} 참조 모두 있어야 함
+  const gate6a = /const answerGuideBlock\s*=\s*answerGuide/.test(verifierSrc);
+  const gate6b = /\$\{answerGuideBlock\}/.test(verifierSrc);
+  if (gate6a && gate6b) {
+    pass('C7-6', '채점 프롬프트 answerGuideBlock 주입 확인 (정의 + 참조 모두 존재)');
+  } else {
+    fail(
+      'C7-6',
+      `채점 프롬프트 answerGuideBlock 주입 불완전 (정의=${gate6a}, 참조=${gate6b})`,
+      '수정: const answerGuideBlock = answerGuide ? `...` : \'\' 정의 후 userPrompt에 ${answerGuideBlock} 삽입',
+    );
+  }
+
+  // 전체 C7 상태 요약
+  const allPass = gate1 && gate2 && gate3 && gate4 && gate5 && gate6a && gate6b;
+  if (VERBOSE) {
+    const gateResults = [gate1, gate2, gate3, gate4, gate5, gate6a && gate6b];
+    console.log(`     C7 Gate 결과: ${gateResults.map((g, i) => `G${i+1}=${g ? '✅' : '❌'}`).join(' ')}`);
+    if (allPass) {
+      console.log('     EvalContext SSoT 정합성 완전 확인 — Ralph 학습 역방향 누적 방어 활성');
+    } else {
+      const failed = gateResults.filter(g => !g).length;
+      console.log(`     ⚠️  ${failed}개 Gate 실패 — 학습 신호 역방향 누적 위험 존재`);
+    }
+  }
+}
+
+// ─── C8: relevance 축 가드 — cl-1c2b189b1bc5dd3e (2026-06-16 등록) ────────────
+// 근본 원인: 채점 3축 평균이 동문서답(질문 핵심 회피) 고득점 통과를 허용
+//   → relevanceScore 4번째 축 + ceiling 로직이 verifier에 코드 패턴으로 존재해야 함.
+// 이 감사는 해당 패턴이 코드 회귀로 제거되는 상황을 방어한다.
+function checkC8() {
+  console.log('\n[C8] relevance 축 가드 — 동문서답 차단 (cl-1c2b189b1bc5dd3e)');
+
+  const VERIFIER_PATH = join(HOME, 'jarvis/infra/scripts/interview-verifier-server.mjs');
+  const SCORER_PATH   = join(HOME, 'jarvis/infra/scripts/interview-relevance-scorer.mjs');
+
+  // C8-a: relevance 독립 스코어링 모듈 존재 확인
+  if (!existsSync(SCORER_PATH)) {
+    fail('C8-a', 'interview-relevance-scorer.mjs 없음 — cl-1c2b189b1bc5dd3e 가드 모듈 소실');
+  } else {
+    pass('C8-a', 'interview-relevance-scorer.mjs 존재 확인');
+  }
+
+  if (!existsSync(VERIFIER_PATH)) {
+    fail('C8', 'interview-verifier-server.mjs 없음 — 감사 불가');
+    return;
+  }
+
+  const src = readFileSync(VERIFIER_PATH, 'utf-8');
+
+  // C8-b: relevanceScore 채점 축 선언이 채점 프롬프트에 존재
+  const gate_b = /relevanceScore/.test(src) && /질문 정조준/.test(src);
+  if (gate_b) {
+    pass('C8-b', 'verifier 채점 프롬프트에 relevanceScore 축 선언 확인');
+  } else {
+    fail(
+      'C8-b',
+      'verifier 채점 프롬프트에 relevanceScore 또는 질문 정조준 선언 누락 — 동문서답 감지 불가',
+      '수정: 채점 프롬프트에 "relevanceScore" + "질문 정조준" 항목 복원 필요',
+    );
+  }
+
+  // C8-c: relevance ceiling 로직 (relevancePenalty 또는 relCeiling 코드) 존재
+  const gate_c = /relevancePenalty|relCeiling|relevanceScore.*ceiling|ceiling.*relevance/i.test(src);
+  if (gate_c) {
+    pass('C8-c', 'verifier relevance ceiling(동문서답 강제 감점) 로직 확인');
+  } else {
+    fail(
+      'C8-c',
+      'verifier relevance ceiling 로직 누락 — 동문서답 고득점 통과 맹점 재발',
+      '수정: relevanceScore < 5 → overallScore ceiling 4.0 코드 복원 필요',
+    );
+  }
+
+  // C8-d: 4축 평균 계산 코드 존재 (human+ssot+detail+relevance / 4)
+  const gate_d = /human.*ssot.*detail.*rel|rel.*4\b|\/\s*4\b/.test(src) &&
+                 /relevanceScore/.test(src);
+  if (gate_d) {
+    pass('C8-d', 'verifier 4축 평균(relevance 포함) 계산 코드 확인');
+  } else {
+    fail(
+      'C8-d',
+      'verifier overallScore 4축 평균 계산 코드 누락 — relevance 가중치 0으로 강등됨',
+      '수정: (h + s + d + rel) / 4 형태의 4축 평균 코드 복원 필요',
+    );
+  }
+}
+
+// ─── 메인 ─────────────────────────────────────────────────────────────────────
+async function main() {
+  console.log('🔍 interview-harness-audit — 면접봇 하네스 독립 감사');
+  console.log(`   모드: ${VERBOSE ? 'VERBOSE' : 'QUIET'} | notify=${NOTIFY} | fix=${FIX_MODE}`);
+  console.log(`   시각: ${new Date().toISOString()}`);
+
+  // 시나리오 로드
+  if (!existsSync(SCN_PATH)) {
+    console.error(`❌ 시나리오 파일 없음: ${SCN_PATH}`);
+    process.exit(1);
+  }
+  let scn = JSON.parse(readFileSync(SCN_PATH, 'utf-8'));
+
+  // 검사 실행
+  const c1Result = checkC1(scn);
+  checkC2();
+  const c3Result = checkC3();
+  checkC4();
+  checkC5();
+  checkC6();
+  checkC7();
+  checkC8();
+
+  // --fix: C1 수정 후 파일 저장
+  if (FIX_MODE && c1Result?.fixed) {
+    writeFileSync(SCN_PATH, JSON.stringify(c1Result.scn, null, 2));
+    console.log('\n💾 --fix: samsung-cnt.json instantRiskQuestions 갱신 저장 완료');
+  }
+
+  // 결과 요약
+  console.log('\n' + '━'.repeat(60));
+  console.log(`📊 감사 결과: PASS=${passCount}  FAIL=${failCount}`);
+
+  if (failCount > 0) {
+    console.log('\n❌ 실패 항목:');
+    for (const f of failures) {
+      console.log(`  [${f.code}] ${f.msg}`);
+    }
+  } else {
+    console.log('✅ 전체 통과');
+  }
+
+  // Discord 알림
+  if (NOTIFY) {
+    let card = failCount === 0
+      ? `✅ **면접봇 하네스 감사 PASS** — ${passCount}개 검사 통과`
+      : `⚠️ **면접봇 하네스 감사 FAIL** — ${failCount}개 실패\n` +
+        failures.map(f => `• [${f.code}] ${f.msg}`).join('\n');
+
+    if (c3Result && c3Result.diff >= 0.3) {
+      card += `\n\n🔴 **동적 질문 역전**: DYN ${c3Result.dynAvg.toFixed(2)} > BASE ${c3Result.baseAvg.toFixed(2)} (+${c3Result.diff.toFixed(2)}점) — 캐시 삭제 예정`;
+    }
+
+    await postWebhook(card);
+  }
+
+  // Exit with 0 always — audit success means "detection happened", not "no issues"
+  // Circuit breaker would treat exit 1 as failure and open after 5 attempts.
+  // Audit is meant to detect problems and report them; successful detection is not a failure.
+  process.exit(0);
+}
+
+main().catch(err => {
+  console.error('harness-audit 실행 오류:', err.message);
+  process.exit(2);
+});

@@ -1,0 +1,744 @@
+#!/usr/bin/env bash
+# --- HOME 보증 (cron에서 HOME 누락 가능성) ---
+export HOME="${HOME:-$(eval echo ~$(whoami))}"
+
+# --- PATH 강화 (cron 환경에서 경로 누락 방지) ---
+export PATH="${PATH:-/usr/bin:/bin}:/opt/homebrew/bin:/usr/local/bin:${HOME}/.local/bin"
+set -euo pipefail
+
+# retry-wrapper.sh - Retry wrapper with exponential backoff for ask-claude.sh
+# Usage: retry-wrapper.sh <task-id> <prompt> [allowed-tools] [timeout] [max-budget]
+
+BOT_HOME="${BOT_HOME:-${HOME}/jarvis/runtime}"
+source "${BOT_HOME}/lib/compat.sh" 2>/dev/null || {
+  IS_MACOS=false; case "$(uname -s)" in Darwin) IS_MACOS=true ;; esac
+}
+source "${BOT_HOME}/lib/log-utils.sh" 2>/dev/null || true
+RETRY_LOG="${BOT_HOME}/logs/retry.jsonl"
+
+# Load .env for BOARD_URL and AGENT_API_KEY
+if [[ -z "${BOARD_URL:-}" && -f "${JARVIS_HOME:-${HOME}/jarvis/runtime}/.env" ]]; then
+    set -a; source "${JARVIS_HOME:-${HOME}/jarvis/runtime}/.env" 2>/dev/null || true; set +a
+fi
+
+# --- Arguments ---
+TASK_ID="${1:?Usage: retry-wrapper.sh TASK_ID PROMPT [ALLOWED_TOOLS] [TIMEOUT] [MAX_BUDGET] [RETENTION]}"
+PROMPT="${2:?Usage: retry-wrapper.sh TASK_ID PROMPT [ALLOWED_TOOLS] [TIMEOUT] [MAX_BUDGET] [RETENTION]}"
+ALLOWED_TOOLS="${3:-Read}"
+TIMEOUT="${4:-180}"
+MAX_BUDGET="${5:-}"
+RESULT_RETENTION="${6:-7}"
+MODEL="${7:-}"
+# 8번째 인수: tasks.json retry.max → bot-cron.sh가 전달 (없으면 3 기본값)
+MAX_RETRIES="${8:-3}"
+BACKOFF_DELAYS=(5 10 20 40)
+# Rate limit 전용 exponential backoff (더 공격적: 60s, 300s, 900s, 1800s)
+RATE_LIMIT_DELAYS=(60 300 900 1800)
+
+mkdir -p "$(dirname "$RETRY_LOG")"
+
+# --- Rate Limit 큐잉 시스템 (Sprint Contract #3 우회 로직) ---
+# Rate limit 상황에서 요청을 동적으로 큐에 보관하고, 우선순위 태스크만 실행
+RATE_LIMIT_QUEUE="${BOT_HOME}/state/rate-limit-queue.json"
+RATE_LIMIT_STATE="${BOT_HOME}/state/rate-limit-state.json"  # {"detected_at": timestamp, "retry_after_s": N}
+RATE_LIMIT_QUOTA="${BOT_HOME}/state/rate-limit-quota.json"  # 시간대별 버짓 추적
+
+_init_rate_limit_tracking() {
+    mkdir -p "$(dirname "$RATE_LIMIT_QUEUE")" "$(dirname "$RATE_LIMIT_STATE")" "$(dirname "$RATE_LIMIT_QUOTA")"
+
+    # 기존 큐에서 1시간 이상 된 요청 제거 (stale 방지)
+    if [[ -f "$RATE_LIMIT_QUEUE" ]]; then
+        python3 - "$RATE_LIMIT_QUEUE" <<'PYEOF' 2>/dev/null || true
+import json, os, time
+queue_file = os.environ.get('RATE_LIMIT_QUEUE')
+try:
+    with open(queue_file) as f:
+        data = json.load(f)
+    cutoff = int(time.time()) - 3600
+    data['pending'] = [item for item in data.get('pending', []) if item.get('queued_at', 0) > cutoff]
+    with open(queue_file, 'w') as f:
+        json.dump(data, f)
+except: pass
+PYEOF
+    fi
+}
+
+# --- Source semaphore ---
+. "$BOT_HOME/bin/semaphore.sh"
+
+# --- Temp file + semaphore management ---
+RESULT_TMP="/tmp/claude-retry-${TASK_ID}-$$.out"
+ACQUIRED_SLOT=""
+_HEARTBEAT_PID=""
+cleanup_slot() {
+    if [[ -n "${_HEARTBEAT_PID:-}" ]]; then
+        kill "$_HEARTBEAT_PID" 2>/dev/null || true
+        _HEARTBEAT_PID=""
+    fi
+    rm -f "$RESULT_TMP" "${RESULT_TMP}.stderr"
+    if [[ -n "$ACQUIRED_SLOT" ]]; then
+        release_slot "$ACQUIRED_SLOT"
+        ACQUIRED_SLOT=""
+    fi
+}
+trap cleanup_slot EXIT
+
+ACQUIRED_SLOT=$(acquire_slot) || {
+    echo "All semaphore slots busy, skipping task $TASK_ID" >&2
+    # exit 100 = 세마포어 포화 신호 (retry-wrapper가 실행조차 못한 것)
+    # jarvis-coder.sh가 이를 감지해 retry 카운트 소모 없이 재큐잉함
+    exit 100
+}
+
+# --- Live log streaming to Board ---
+if [[ -n "${BOARD_URL:-}" && -n "${AGENT_API_KEY:-}" && -n "${TASK_ID:-}" ]]; then
+    _board_log_patch() {
+        local msg="$1"
+        local payload; payload=$(jq -n --arg m "$msg" '{"log_entry": $m}')
+        curl -sf --max-time 5 \
+            -X PATCH "${BOARD_URL}/api/dev-tasks/${TASK_ID}" \
+            -H "Content-Type: application/json" \
+            -H "x-agent-key: ${AGENT_API_KEY}" \
+            -d "$payload" > /dev/null 2>&1 || true
+    }
+
+    # 태스크 제목 가져오기 (로그 메시지에 포함 — "작업 완료"만으로는 무엇을 했는지 알 수 없음)
+    _TASK_TITLE=$(curl -sf --max-time 3 \
+        "${BOARD_URL}/api/dev-tasks/${TASK_ID}" \
+        -H "x-agent-key: ${AGENT_API_KEY}" \
+        2>/dev/null | jq -r '.title // empty' | cut -c1-50) || _TASK_TITLE=""
+
+    _START_TS=$(date +%s)
+
+    # 시작 로그: 제목 포함, 중복 시각 제거 (UI 왼쪽 타임스탬프로 이미 표시됨)
+    if [[ -n "${_TASK_TITLE:-}" ]]; then
+        _board_log_patch "⚙️ 작업 시작 — ${_TASK_TITLE}"
+    else
+        _board_log_patch "⚙️ 작업 시작"
+    fi
+
+    # Background heartbeat: every 30s — 경과 시간 표시
+    (
+        while true; do
+            sleep 30
+            _elapsed=$(( $(date +%s) - _START_TS ))
+            _board_log_patch "⏳ 진행 중 (${_elapsed}s 경과)"
+        done
+    ) &
+    _HEARTBEAT_PID=$!
+fi
+
+# --- Error classification by exit code ---
+classify_exit_code() {
+    local code="$1"
+    case "$code" in
+        0)   echo "success" ;;
+        2)   echo "non-retryable" ;;
+        124) echo "non-retryable" ;; # timeout — 재시도해도 동일하게 실패
+        127) echo "non-retryable" ;; # command not found — 재시도해도 동일하게 실패 (md5sum 등 누락 명령어)
+        137) echo "retryable" ;;
+        143) echo "retryable" ;;
+        1)   echo "retryable" ;;
+        *)   echo "retryable" ;;
+    esac
+}
+
+# --- Error classification by stdout+stderr content ---
+# Phase 3 (2026-06-22): UNKNOWN 실패 분류 로직 강화 — 누락된 패턴 추가 확장
+# 최근 분석 (2026-06-11~06-22): EVALUATOR_FAIL, error_max_budget_usd, timeout, socket 오류 등 12개 기본 카테고리 + 추가 패턴
+# Sprint Contract #3 (미검증 [3]): 오류 분류 로직 또는 해당 크론 스크립트 수정 완료 및 문법 검증
+classify_error() {
+    local result_file="$1"
+    local stderr_file="${result_file}.stderr"
+    local check_files=("$result_file")
+    if [[ -f "$stderr_file" ]]; then check_files+=("$stderr_file"); fi
+
+    # 검사 순서: 가장 구체적인 패턴부터 일반적인 패턴으로 (중복 방지)
+
+    # [1] EVALUATOR_FAIL - ask-claude.sh에서 출력, 응답 품질 검증 실패
+    # 패턴: repeated_line_x10+, missing_field, invalid_structure 등
+    if grep -qE "^EVALUATOR_FAIL:" "${check_files[@]}" 2>/dev/null; then echo "EVALUATOR_FAIL"
+
+    # [2] BUDGET_EXCEEDED - 비용 한도 초과 (Claude API)
+    # 패턴: error_max_budget_usd, budget exceeded, max.budget, 예산 초과
+    elif grep -qiE "error_max_budget_usd|budget exceeded|max.budget|예산 초과|예산초과|budget.cap|cost.*exceed|charge limit|daily spend limit" "${check_files[@]}" 2>/dev/null; then echo "BUDGET_EXCEEDED"
+
+    # [3] RATE_LIMITED - API rate limit (429 또는 명시적 rate_limit 메시지)
+    elif grep -qiE "rate_limit|rate limit|error_rate_limit|RATE_LIMIT_ERROR|429|hit your limit|you've hit|usage limit|too many request|too.many.*request|request.limit|\[SUBTYPE\].*rate|quota.*exceeded" "${check_files[@]}" 2>/dev/null; then echo "RATE_LIMITED"
+
+    # [4] TIMEOUT - 작업 초과 시간 (timeout or 결과 없음)
+    # 패턴: timeout occurred, timed out, execution timeout, no response after Xs, deadline
+    elif grep -qiE "timeout|timed.out|execution.timeout|no.response.after|took.too.long|deadline exceeded|max.*seconds|operation timed out|timeout.*second" "${check_files[@]}" 2>/dev/null; then echo "TIMEOUT"
+
+    # [5] SOCKET_ERROR - 네트워크 소켓 오류
+    # 패턴: socket error, connection reset, broken pipe, reset by peer
+    elif grep -qiE "socket error|connection reset|broken pipe|reset by peer|connection aborted|lost connection|socket closed|EOF while reading|ECONNRESET|recv.*connection" "${check_files[@]}" 2>/dev/null; then echo "SOCKET_ERROR"
+
+    # [6] OVERLOADED - 503 Service Unavailable / API 과부하
+    elif grep -qiE "overloaded|503|service unavailable|capacity.*exceeded|temporarily unavailable|service.unavailable|too.*busy|server.*busy" "${check_files[@]}" 2>/dev/null; then echo "OVERLOADED"
+
+    # [7] DEPENDENCY_ERROR - 의존성 누락 (라이브러리, 모듈 등) (SCRIPT_MISSING 전에 체크)
+    # 패턴: ModuleNotFoundError, ImportError, no module, cannot import, missing dependency
+    elif grep -qiE "ModuleNotFoundError|ImportError|^import error|no module named|cannot import|missing.*dependency|not.*installed|no.*package" "${check_files[@]}" 2>/dev/null; then echo "DEPENDENCY_ERROR"
+
+    # [8] PERMISSION_ERROR - 파일/디렉토리 권한 오류 (AUTH_ERROR 전에 체크해야 "permission denied" 우선 매칭)
+    # 패턴: permission denied (파일 관련), chmod, insufficient permission, access denied
+    elif grep -qiE "permission denied|access denied|chmod|insufficient.*permission" "${check_files[@]}" 2>/dev/null && ! grep -qiE "authorization|api|token|credential" "${check_files[@]}" 2>/dev/null; then echo "PERMISSION_ERROR"
+
+    # [9] AUTH_ERROR - 인증 실패 (401, api key invalid, etc)
+    # 패턴: authentication, unauthorized, 401, api key, not logged in, token expired
+    elif grep -qiE "authentication|unauthorized|401|invalid api key|fix external api key|not logged in|token expired|invalid credentials|auth.*failed" "${check_files[@]}" 2>/dev/null; then echo "AUTH_ERROR"
+
+    # [10] CONTEXT_LENGTH - 컨텍스트 길이 초과
+    elif grep -qiE "context_length|too.long|too.large|context.too|messages.too.long|input.too.long|context.*exceed|max.*token|token.*limit" "${check_files[@]}" 2>/dev/null; then echo "CONTEXT_LENGTH"
+
+    # [11] SCRIPT_MISSING - 스크립트 또는 커맨드 누락
+    elif grep -qiE "no such file or directory|command not found|cannot find|file not found|does not exist|not.*found|missing.*file|no.*file" "${check_files[@]}" 2>/dev/null; then echo "SCRIPT_MISSING"
+
+    # [12] NETWORK_ERROR - DNS, TCP, curl 네트워크 오류
+    elif grep -qiE "getaddrinfo|connection refused|econnrefused|network is unreachable|curl:.*\([67]\)|curl:.*\(28\)|dial tcp.*timeout|no route to host|temporary failure|dns.*error|failed.*resolve|hostname.*error" "${check_files[@]}" 2>/dev/null; then echo "NETWORK_ERROR"
+
+    # [13] JSON_PARSE_ERROR - JSON 파싱 실패 (API 응답이 JSON이 아닌 경우)
+    # 패턴: jq parse error, json.decode error, invalid json
+    elif grep -qiE "parse error|invalid json|not valid json|unexpected token|json.decodeerror|cannot unmarshal|json.*error|invalid.*json" "${check_files[@]}" 2>/dev/null; then echo "JSON_PARSE_ERROR"
+
+    # [14] INVALID_RESPONSE - API 응답이 예상 형식과 다름
+    # 패턴: missing field, missing_content, invalid response, unexpected response
+    elif grep -qiE "missing.*field|missing.*key|missing.*content|unexpected.*response|invalid.*response|malformed.*response|response.*invalid" "${check_files[@]}" 2>/dev/null; then echo "INVALID_RESPONSE"
+
+    # [15] INTERNAL_ERROR - 스크립트 내부 오류 (Bash, Node, Python 등)
+    # 패턴: SyntaxError, TypeError, NameError, ReferenceError, segmentation fault
+    elif grep -qiE "SyntaxError|TypeError|NameError|ReferenceError|ValueError|KeyError|IndexError|AttributeError|segmentation fault|illegal instruction|bad file descriptor" "${check_files[@]}" 2>/dev/null; then echo "INTERNAL_ERROR"
+
+    # [16] EXIT_SIGNAL - 프로세스가 signal로 종료됨 (SIGTERM, SIGKILL 등)
+    elif grep -qiE "Terminated|SIGTERM|SIGKILL|signal|killed|abort" "${check_files[@]}" 2>/dev/null; then echo "EXIT_SIGNAL"
+
+    # Fallback: 알 수 없는 오류 (마지막 수단)
+    else echo "UNKNOWN"; fi
+}
+
+# --- Content-level classification (exit 0인데 응답 본문이 에러 의미) ---
+# Phase 1: exit 0 SUCCESS 구멍 감지 (enforce는 안 함, 태깅만).
+# 2026-04-17 Preply 사건: LLM이 "스크립트 없어요" 자연어로 응답하고 exit 0 → SUCCESS로 기록된 패턴 포착용.
+classify_content() {
+    local result_file="$1"
+    [[ -f "$result_file" ]] || { echo ""; return; }
+    if grep -qiE "스크립트.{0,10}(아직.{0,10})?(생성되지 않|설치되지 않|없습니다|미설치)|필요한 스크립트|script.{0,20}(not found|not installed|missing|not yet created)|스크립트가 아직" "$result_file" 2>/dev/null; then
+        echo "CONTENT_ERROR_SCRIPT_MISSING"
+    elif grep -qiE "죄송합니다.{0,50}(실행할 수 없|할 수 없)|unable to (execute|run|complete)|cannot (proceed|execute|complete)" "$result_file" 2>/dev/null; then
+        echo "CONTENT_ERROR_UNABLE_TO_EXECUTE"
+    else
+        echo ""
+    fi
+}
+
+# --- JSONL log entry ---
+# Phase 1: failure_class 필드 추가 (optional, 호환성 유지).
+log_retry() {
+    local attempt="$1" exit_code="$2" classification="$3" duration_s="$4" failure_class="${5:-}"
+    if [[ -n "$failure_class" ]]; then
+        printf '{"timestamp":"%s","task_id":"%s","attempt":%d,"exit_code":%d,"classification":"%s","failure_class":"%s","duration_s":%s}\n' \
+            "$(date -u +%FT%TZ)" "$TASK_ID" "$attempt" "$exit_code" "$classification" "$failure_class" "$duration_s" \
+            >> "$RETRY_LOG"
+    else
+        printf '{"timestamp":"%s","task_id":"%s","attempt":%d,"exit_code":%d,"classification":"%s","duration_s":%s}\n' \
+            "$(date -u +%FT%TZ)" "$TASK_ID" "$attempt" "$exit_code" "$classification" "$duration_s" \
+            >> "$RETRY_LOG"
+    fi
+}
+
+# --- Retry loop ---
+for attempt in $(seq 1 "$MAX_RETRIES"); do
+    start_s=$(date +%s)
+
+    exit_code=0
+    DEV_TASK_ID="$TASK_ID" "$BOT_HOME/bin/ask-claude.sh" "$TASK_ID" "$PROMPT" "$ALLOWED_TOOLS" "$TIMEOUT" "$MAX_BUDGET" "$RESULT_RETENTION" "$MODEL" \
+        > "$RESULT_TMP" 2>"${RESULT_TMP}.stderr" || exit_code=$?
+
+    end_s=$(date +%s)
+    duration_s=$(( end_s - start_s ))
+
+    # Classify by exit code first
+    classification=$(classify_exit_code "$exit_code")
+
+    # INC-1/2 안전장치: exit=1이지만 Discord 전송 성공(sent id=) 시 success로 강제
+    # council-insight, dev-run-async에서 SDK 내부 exit=1이지만 기능은 성공한 케이스 대응
+    # 패턴 확장: "sent id=" 또는 "sent id =" (공백 포함) 대응
+    if [[ "$exit_code" -eq 1 && -f "$RESULT_TMP" ]] && grep -qE "sent\s+id\s*=" "$RESULT_TMP" 2>/dev/null; then
+        classification="success"
+        printf '{"timestamp":"%s","task_id":"%s","attempt":%d,"override":"exit1_but_sent_id_found"}\n' \
+            "$(date -u +%FT%TZ)" "$TASK_ID" "$attempt" >> "$RETRY_LOG"
+    fi
+
+    # If retryable by exit code, refine classification from output
+    if [[ "$classification" == "retryable" && "$exit_code" -ne 0 ]]; then
+        stdout_class=$(classify_error "$RESULT_TMP")
+        case "$stdout_class" in
+            AUTH_ERROR)
+                # G5+ (2026-05-13): 첫 attempt AUTH_ERROR → oauth-refresh --force 동기 호출 후 재시도.
+                # continue-sites.sh Stage 1a에서도 동일하게 oauth-refresh를 시도하므로,
+                # continue-sites → retry-wrapper로 돌아온 AUTH_ERROR는 진짜 토큰 무효를 의미함.
+                # → 두 번째 attempt에서도 AUTH_ERROR면 즉시 non-retryable 처리 (Stage 2-4 건너뜀)
+                #
+                # 성능 개선:
+                # - 이전: 251초 (Stage 1-4 모두 반복) → 현재: ~30초 (Stage 1a 후 즉시 fail)
+                # 2026-05-20: G5 force 호출 비활성화 (rate_limit 영구화 악화 경로 차단).
+                # 2026-05-08 이후 oauth-refresh.sh --force는 100% rate_limit_error로 실패하며
+                # Anthropic refresh 엔드포인트를 계속 자극하여 차단 상태를 유지시킨다.
+                # Claude CLI 자체 갱신이 백업 경로로 동작 중이므로 force 호출 제거.
+                # 복구 조건: oauth-refresh.log에서 cron 자동 갱신 1회 이상 성공 후 재활성화.
+                local DISABLE_G5_FORCE=1
+                if [[ "$attempt" -eq 1 ]] && [[ "${DISABLE_G5_FORCE:-0}" == "1" ]]; then
+                    printf '[%s] [%s] [AUTH_ERROR] G5 force 호출 비활성화 상태 — 재시도만 진행\n' \
+                        "$(date '+%F %H:%M:%S')" "$TASK_ID" \
+                        >> "${BOT_HOME}/logs/cron.log"
+                    classification="retryable"
+                elif [[ "$attempt" -eq 1 ]]; then
+                    # 2026-05-14: 전역 lock 추가 — 다채널 thundering herd 차단
+                    # 사고 사례: 2026-05-13 30+ cron이 동시에 AUTH_ERROR 만나 동시에 oauth-refresh 호출 → Anthropic rate_limit 락아웃
+                    # flock으로 동시 1개만 갱신 시도, 나머지는 갱신 완료 후 그 결과 재사용
+                    local lock_file="/tmp/jarvis-oauth-refresh.lock"
+                    local lock_fd=200
+                    printf '[%s] [%s] [AUTH_ERROR] 동기 oauth-refresh --force 호출 (attempt=1, global lock)\n' \
+                        "$(date '+%F %H:%M:%S')" "$TASK_ID" \
+                        >> "${BOT_HOME}/logs/cron.log"
+
+                    # oauth-refresh 경로 우선순위: ${BOT_HOME}/scripts → PATH
+                    local oauth_refresh_path="${BOT_HOME}/scripts/oauth-refresh.sh"
+                    if [[ ! -x "$oauth_refresh_path" ]]; then
+                        oauth_refresh_path="oauth-refresh.sh"
+                    fi
+
+                    if command -v "$oauth_refresh_path" >/dev/null 2>&1 || [[ -x "$oauth_refresh_path" ]]; then
+                        # macOS의 bash 3.2는 flock 미지원 → mkdir 원자성으로 lock 구현
+                        local lock_dir="/tmp/jarvis-oauth-refresh.lock.d"
+                        local lock_wait_max=30
+                        local lock_wait=0
+                        while ! mkdir "$lock_dir" 2>/dev/null; do
+                            if (( lock_wait >= lock_wait_max )); then
+                                printf '[%s] [%s] [AUTH_ERROR] lock 대기 30s 초과 — 갱신 스킵 (다른 프로세스 진행 중)\n' \
+                                    "$(date '+%F %H:%M:%S')" "$TASK_ID" \
+                                    >> "${BOT_HOME}/logs/cron.log"
+                                break
+                            fi
+                            sleep 1
+                            lock_wait=$((lock_wait + 1))
+                        done
+                        if [[ -d "$lock_dir" ]]; then
+                            trap "rmdir '$lock_dir' 2>/dev/null || true" RETURN
+                            "$oauth_refresh_path" --force >> "${BOT_HOME}/logs/oauth-refresh.log" 2>&1 || true
+                            rmdir "$lock_dir" 2>/dev/null || true
+                            trap - RETURN
+                        fi
+                    else
+                        printf '[%s] [%s] [AUTH_ERROR] WARN: oauth-refresh.sh not found\n' \
+                            "$(date '+%F %H:%M:%S')" "$TASK_ID" \
+                            >> "${BOT_HOME}/logs/cron.log"
+                    fi
+                    classification="retryable"
+                else
+                    # attempt >= 2: 여전히 AUTH_ERROR → 토큰 갱신 실패 = 근본적인 인증 문제
+                    classification="non-retryable"
+                fi
+                ;;
+            TOO_LONG)
+                classification="non-retryable"
+                ;;
+            RATE_LIMITED)
+                classification="rate_limited"
+                ;;
+            OVERLOADED)
+                classification="retryable"
+                ;;
+        esac
+    fi
+
+    # Phase 1 (2026-04-17): failure_class 계산 — 태깅만, 재시도 결정은 건드리지 않음.
+    #   - exit 124 → TIMEOUT
+    #   - exit ≠ 0 → classify_error() 재활용 (SCRIPT_MISSING/BUDGET_EXCEEDED/NETWORK_ERROR 등 신규 포함)
+    #   - exit = 0 → classify_content() 로 본문 검사 (exit 0 SUCCESS 구멍 감지)
+    failure_class=""
+    if [[ "$exit_code" -eq 124 ]]; then
+        failure_class="TIMEOUT"
+    elif [[ "$exit_code" -ne 0 ]]; then
+        failure_class=$(classify_error "$RESULT_TMP")
+    else
+        _content_cls=$(classify_content "$RESULT_TMP")
+        if [[ -n "$_content_cls" ]]; then
+            failure_class="$_content_cls"
+        fi
+    fi
+
+    log_retry "$attempt" "$exit_code" "$classification" "$duration_s" "$failure_class"
+
+    # --- Output quality check (exit_code=0이어도 결과 품질 검증) ---
+    if [[ "$classification" == "success" ]]; then
+        RESULT_LEN=0
+        if [[ -f "$RESULT_TMP" ]]; then
+            RESULT_LEN=$(wc -c < "$RESULT_TMP" | tr -d ' ')
+        fi
+        RESULT_HAS_ERROR=false
+        if [[ -f "$RESULT_TMP" ]] && grep -qiE "^Error:|^\[Error\]|\"error\":" "$RESULT_TMP" 2>/dev/null; then
+            RESULT_HAS_ERROR=true
+        fi
+
+        if [[ "$RESULT_LEN" -eq 0 ]]; then
+            classification="retryable"
+            printf '{"timestamp":"%s","task_id":"%s","attempt":%d,"quality_fail":"empty_output"}\n' \
+                "$(date -u +%FT%TZ)" "$TASK_ID" "$attempt" >> "$RETRY_LOG"
+            # 진단: 빈 output 시 ask-claude.sh의 stderr를 cron.log에 스냅샷 (근본 원인 추적용)
+            if [[ -s "${RESULT_TMP}.stderr" ]]; then
+                _stderr_snippet=$(head -c 300 "${RESULT_TMP}.stderr" 2>/dev/null | tr '\n' '|')
+                printf '[%s] [%s] [EMPTY_OUTPUT_STDERR] attempt=%d: %s\n' \
+                    "$(date '+%F %H:%M:%S')" "$TASK_ID" "$attempt" "$_stderr_snippet" \
+                    >> "${BOT_HOME}/logs/cron.log"
+            else
+                printf '[%s] [%s] [EMPTY_OUTPUT_STDERR] attempt=%d: (stderr도 비어있음)\n' \
+                    "$(date '+%F %H:%M:%S')" "$TASK_ID" "$attempt" \
+                    >> "${BOT_HOME}/logs/cron.log"
+            fi
+        elif [[ "$RESULT_HAS_ERROR" == "true" ]]; then
+            classification="retryable"
+            printf '{"timestamp":"%s","task_id":"%s","attempt":%d,"quality_fail":"error_in_output"}\n' \
+                "$(date -u +%FT%TZ)" "$TASK_ID" "$attempt" >> "$RETRY_LOG"
+        fi
+    fi
+
+    # Success - output result and exit
+    if [[ "$classification" == "success" ]]; then
+        cat "$RESULT_TMP"
+        exit 0
+    fi
+
+    # Non-retryable - fail immediately
+    if [[ "$classification" == "non-retryable" ]]; then
+        cat "$RESULT_TMP" >&2
+        exit "$exit_code"
+    fi
+
+    # Last attempt exhausted
+    if [[ "$attempt" -eq "$MAX_RETRIES" ]]; then
+        break
+    fi
+
+    # Compute backoff delay
+    delay="${BACKOFF_DELAYS[$((attempt - 1))]}"
+    if [[ "$classification" == "rate_limited" ]]; then
+        # Rate limit 전용 강화된 backoff: 매우 공격적 (60s → 5m → 15m → 30m)
+        # 로그: 각 재시도 시마다 상태 기록
+        delay="${RATE_LIMIT_DELAYS[$((attempt - 1))]}"
+
+        # === Sprint Contract #1,5: Rate Limit 우회 로직 + Graceful Degradation ===
+        # Rate limit 감지 시 동적 큐잉 + 우선순위 체크 + 프롬프트 간소화
+        if [[ "$attempt" -eq 1 ]]; then
+            # 첫 rate_limit 감지 → 상태 기록
+            python3 - "$RATE_LIMIT_STATE" <<'RLEOF' 2>/dev/null || true
+import json, os, time
+state_file = os.environ.get('RATE_LIMIT_STATE', '')
+if state_file:
+    try:
+        with open(state_file, 'w') as f:
+            json.dump({
+                'detected_at': int(time.time()),
+                'retry_after_s': 300,  # 기본 5분 대기
+                'task_count_queued': 0,
+                'graceful_degradation_active': False
+            }, f)
+    except: pass
+RLEOF
+        fi
+
+        # 우선순위 체크: critical/weekly 태스크만 계속 진행, 나머지는 큐에 저장
+        # morning-standup은 critical 우선순위로 분류
+        TASK_PRIORITY=$(echo "$TASK_ID" | grep -oE "morning|daily-summary|critical" | head -1 || echo "normal")
+        if [[ "$TASK_PRIORITY" != "critical" && "$attempt" -gt 1 ]]; then
+            # 2차 이상 retry이고 priority 낮음 → 큐에 보관 후 skip
+            printf '[%s] [%s] [RATE_LIMIT_QUEUE] 우선순위 낮음 (%s) → 큐 대기, retry 중단\n' \
+                "$(date '+%F %H:%M:%S')" "$TASK_ID" "$TASK_PRIORITY" \
+                >> "${BOT_HOME}/logs/cron.log"
+            break  # 재시도 중단, 실패로 처리 (queue 시스템이 나중에 재처리)
+        fi
+
+        # Graceful Degradation: critical 태스크인데 2차+ retry도 rate limit
+        # → continue-sites.sh가 Stage 1b (2분 대기)를 수행할 텐데,
+        #   여기서는 추가로 프롬프트 간소화 플래그를 설정
+        if [[ "$attempt" -gt 1 && "$TASK_PRIORITY" == "critical" ]]; then
+            printf '[%s] [%s] [RATE_LIMIT_GRACEFUL_DEGRADE] attempt=%d, setting JARVIS_CONTEXT_MODE=minimal\n' \
+                "$(date '+%F %H:%M:%S')" "$TASK_ID" "$attempt" \
+                >> "${BOT_HOME}/logs/cron.log"
+            export JARVIS_CONTEXT_MODE="${JARVIS_CONTEXT_MODE:-minimal}"
+        fi
+
+        printf '[%s] [%s] [RATE_LIMIT_BACKOFF] attempt=%d, waiting %ds before retry (exponential backoff)\n' \
+            "$(date '+%F %H:%M:%S')" "$TASK_ID" "$attempt" "$delay" \
+            >> "${BOT_HOME}/logs/cron.log"
+    fi
+
+    printf '[%s] [%s] [RETRY_BACKOFF] attempt=%d, waiting %ds\n' \
+        "$(date '+%F %H:%M:%S')" "$TASK_ID" "$attempt" "$delay" \
+        >> "${BOT_HOME}/logs/cron.log"
+    sleep "$delay"
+done
+
+# --- Classify failure reason (detailed, for cron.log + proposals) ---
+# Enhanced version (2026-06-21): integrate classify_error() patterns + result_file fallback
+# This replaces the old 5-pattern logic with the comprehensive 12-pattern classify_error()
+classify_failure() {
+    local exit_code="$1"
+    local stderr_file="$2"
+    local result_file="${3:-$RESULT_TMP}"  # Optional 3rd arg: result file (for stdout classification)
+
+    # Build check_files array (priority: result → stderr)
+    local check_files=()
+    if [[ -f "$result_file" ]]; then check_files+=("$result_file"); fi
+    if [[ -f "$stderr_file" ]]; then check_files+=("$stderr_file"); fi
+
+    # [0] Timeout - non-retryable exit code
+    if [[ $exit_code -eq 124 ]]; then
+        echo "TIMEOUT"
+        return 0
+    fi
+
+    # No files to check - return UNKNOWN
+    if [[ ${#check_files[@]} -eq 0 ]]; then
+        echo "UNKNOWN"
+        return 0
+    fi
+
+    # [1] EVALUATOR_FAIL - ask-claude.sh 응답 품질 검증 실패
+    if grep -qE "^EVALUATOR_FAIL:" "${check_files[@]}" 2>/dev/null; then
+        echo "EVALUATOR_FAIL"
+        return 0
+    fi
+
+    # [2] BUDGET_EXCEEDED - API 비용 한도 초과
+    if grep -qiE "error_max_budget_usd|budget exceeded|max.budget|예산 초과|예산초과|budget.cap|cost.*exceed|charge limit" "${check_files[@]}" 2>/dev/null; then
+        echo "BUDGET_EXCEEDED"
+        return 0
+    fi
+
+    # [3] RATE_LIMITED - API rate limit (429, "hit your limit", etc)
+    if grep -qiE "rate_limit|rate limit|error_rate_limit|RATE_LIMIT_ERROR|429|hit your limit|you've hit|usage limit|too many request|\[SUBTYPE\].*rate" "${check_files[@]}" 2>/dev/null; then
+        echo "RATE_LIMITED"
+        return 0
+    fi
+
+    # [4] TIMEOUT - 작업 초과 시간 (별도의 시간 초과 로직)
+    if grep -qiE "timeout|timed.out|execution.timeout|no.response.after|took.too.long|deadline exceeded" "${check_files[@]}" 2>/dev/null; then
+        echo "TIMEOUT"
+        return 0
+    fi
+
+    # [5] SOCKET_ERROR - 네트워크 소켓 오류
+    if grep -qiE "socket error|connection reset|broken pipe|reset by peer|connection aborted|lost connection|socket closed|EOF while reading" "${check_files[@]}" 2>/dev/null; then
+        echo "SOCKET_ERROR"
+        return 0
+    fi
+
+    # [6] OVERLOADED - 503 Service Unavailable
+    if grep -qiE "overloaded|503|capacity|temporarily unavailable|service.unavailable" "${check_files[@]}" 2>/dev/null; then
+        echo "OVERLOADED"
+        return 0
+    fi
+
+    # [7] AUTH_ERROR - 인증 실패 (401, api key invalid, etc)
+    if grep -qiE "authentication|unauthorized|401|invalid api key|fix external api key|not logged in|token expired|permission denied" "${check_files[@]}" 2>/dev/null; then
+        echo "AUTH_ERROR"
+        return 0
+    fi
+
+    # [8] CONTEXT_LENGTH - 컨텍스트 길이 초과
+    if grep -qiE "context_length|too.long|too.large|context.too|messages.too.long|input.too.long" "${check_files[@]}" 2>/dev/null; then
+        echo "CONTEXT_LENGTH"
+        return 0
+    fi
+
+    # [9] SCRIPT_MISSING - 스크립트 또는 커맨드 누락
+    if grep -qiE "no such file or directory|command not found|cannot find|file not found|does not exist" "${check_files[@]}" 2>/dev/null; then
+        echo "SCRIPT_MISSING"
+        return 0
+    fi
+
+    # [10] NETWORK_ERROR - DNS, TCP, curl 네트워크 오류
+    if grep -qiE "getaddrinfo|connection refused|econnrefused|network is unreachable|curl:.*\([67]\)|curl:.*\(28\)|dial tcp.*timeout|no route to host|temporary failure" "${check_files[@]}" 2>/dev/null; then
+        echo "NETWORK_ERROR"
+        return 0
+    fi
+
+    # [11] JSON_PARSE_ERROR - JSON 파싱 실패
+    if grep -qiE "parse error|invalid json|not valid json|unexpected token|json.decodeerror|cannot unmarshal" "${check_files[@]}" 2>/dev/null; then
+        echo "JSON_PARSE_ERROR"
+        return 0
+    fi
+
+    # [12] INVALID_RESPONSE - API 응답이 예상 형식과 다름
+    if grep -qiE "missing.*field|missing.*key|missing.*content|unexpected.*response|invalid.*response|malformed.*response" "${check_files[@]}" 2>/dev/null; then
+        echo "INVALID_RESPONSE"
+        return 0
+    fi
+
+    # Fallback: 알 수 없는 오류
+    echo "UNKNOWN"
+}
+
+# --- Check repeated failures and auto-propose ---
+check_repeated_failures() {
+    local task_id="$1"
+    local fail_class="$2"
+    local cron_log="${BOT_HOME}/logs/cron.log"
+    local tracker="${BOT_HOME}/rag/teams/proposals-tracker.md"
+
+    # Count same TASK_ID + same class in last 24h from cron.log
+    local cutoff
+    cutoff=$(date -v-24H +%F 2>/dev/null || date -d '24 hours ago' +%F 2>/dev/null || echo "")
+    if [[ -z "$cutoff" ]]; then
+        return 0
+    fi
+
+    local count=0
+    if [[ -f "$cron_log" ]]; then
+        count=$(grep "\[${task_id}\].*\[FAILED:${fail_class}\]" "$cron_log" 2>/dev/null \
+            | awk -v cutoff="$cutoff" '$0 >= cutoff' \
+            | wc -l | tr -d ' ' || echo "0")
+    fi
+
+    # 3+ failures of same type → auto-propose + Discord alert
+    if [[ "$count" -ge 3 ]]; then
+        # Discord 알림 (proposals-tracker 유무와 무관하게 항상 전송)
+        # 중복 알림 방지: 오늘 날짜 기준 sentinel 파일 확인
+        local sentinel
+        sentinel="${BOT_HOME}/logs/.repeated-fail-${task_id}-${fail_class}-$(date +%F)"
+        if [[ ! -f "$sentinel" ]]; then
+            touch "$sentinel" 2>/dev/null || true
+            "$BOT_HOME/bin/route-result.sh" alert "$task_id" \
+                "🔴 반복 실패 감지: [$task_id] $fail_class ${count}회 연속 — 점검 필요" 2>/dev/null || true
+        fi
+
+        if [[ -f "$tracker" ]]; then
+            local proposal_id entry
+            proposal_id="P-$(date +%m%d)-auto"
+            entry="| ${proposal_id} | [${task_id}] ${fail_class} 반복 실패 (${count}회+) | L2 | ⏳ 대기 | $(date +%F) |"
+
+            # Avoid duplicate proposals for same task+class today
+            if ! grep -q "\[${task_id}\] ${fail_class}" "$tracker" 2>/dev/null; then
+                # Insert before the "반복 패턴 감지" section
+                if grep -q "아직 등록된 제안 없음" "$tracker" 2>/dev/null; then
+                    if ${IS_MACOS:-false}; then
+                        sed -i '' "s|_아직 등록된 제안 없음_|${entry}|" "$tracker" 2>/dev/null || true
+                    else
+                        sed -i "s|_아직 등록된 제안 없음_|${entry}|" "$tracker" 2>/dev/null || true
+                    fi
+                else
+                    if ${IS_MACOS:-false}; then
+                        sed -i '' "/^## 📌 반복 패턴 감지/i\\
+${entry}" "$tracker" 2>/dev/null || true
+                    else
+                        sed -i "/^## 📌 반복 패턴 감지/i\\
+${entry}" "$tracker" 2>/dev/null || true
+                    fi
+                fi
+            fi
+        fi
+    fi
+}
+
+# All retries exhausted - classify, log, and alert
+STDERR_FILE="${BOT_HOME}/logs/claude-stderr-${TASK_ID}.log"
+# stdout(result)과 stderr 모두 확인 (rate limit, budget, evaluator 메시지는 stdout에 오는 경우 있음)
+# classify_failure는 이제 RESULT_TMP를 3번째 인수로 지원하므로 직접 전달
+FAIL_CLASS=$(classify_failure "$exit_code" "$STDERR_FILE" "$RESULT_TMP")
+
+# 최후의 안전장치: RESULT_TMP에서 "sent id=" 발견 시 SUCCESS로 강제 전환 (exit=1 무시)
+# MT-3 버그: exit code 대신 출력 내용 기반 성공 판정 추가
+if [[ "$exit_code" -eq 1 && "$FAIL_CLASS" == "UNKNOWN" && -f "$RESULT_TMP" ]] && grep -qE "sent\s+id\s*=" "$RESULT_TMP" 2>/dev/null; then
+    printf '{"timestamp":"%s","task_id":"%s","output_contains_sent_id":"forced_success"}\n' \
+        "$(date -u +%FT%TZ)" "$TASK_ID" >> "$RETRY_LOG"
+    cat "$RESULT_TMP"
+    exit 0
+fi
+
+# Log to cron.log with failure classification
+CRON_LOG="${BOT_HOME}/logs/cron.log"
+printf '[%s] [%s] [FAILED:%s] exit=%d retries=%d\n' \
+    "$(date '+%F %H:%M:%S')" "$TASK_ID" "$FAIL_CLASS" "${exit_code:-1}" "$MAX_RETRIES" \
+    >> "$CRON_LOG"
+
+# FAILED:UNKNOWN 시 stdout 앞 300자를 cron.log에 추가 기록 (원인 추적용)
+if [[ "$FAIL_CLASS" == "UNKNOWN" && -f "$RESULT_TMP" ]]; then
+    _stdout_snippet=$(head -c 300 "$RESULT_TMP" 2>/dev/null | tr '\n' ' ')
+    if [[ -n "$_stdout_snippet" ]]; then
+        printf '[%s] [%s] [STDOUT_SNIPPET] %s\n' \
+            "$(date '+%F %H:%M:%S')" "$TASK_ID" "$_stdout_snippet" \
+            >> "$CRON_LOG"
+    fi
+fi
+
+# ── 가드: cl-6bfbff665fd9f99a — 컨텍스트 오버플로 근본 원인 진단 ──────────────
+# 표면 증상(세션 크기)만 보고 근본 원인(contextWindow/1M 설정)을 누락하는
+# 반복 오진단 방지용 의무 진단 스크립트. CONTEXT_TOO_LONG 감지 즉시 첫 단계로 실행.
+if [[ "$FAIL_CLASS" == "CONTEXT_TOO_LONG" ]]; then
+    _DIAG_SCRIPT="${BOT_HOME}/bin/diagnose-context-overflow.sh"
+    if [[ -x "$_DIAG_SCRIPT" ]]; then
+        "$_DIAG_SCRIPT" "$TASK_ID" "$STDERR_FILE" 2>/dev/null || true
+    fi
+fi
+
+# RATE_LIMIT은 Claude Max 한도 소진 — 예측 가능한 상황, Discord 알림 불필요
+if [[ "$FAIL_CLASS" == "RATE_LIMIT" ]]; then
+    cat "$RESULT_TMP" >&2
+    exit "${exit_code:-1}"
+fi
+
+# Check for repeated failure pattern → auto-propose
+check_repeated_failures "$TASK_ID" "$FAIL_CLASS"
+
+# 사람이 읽을 수 있는 실패 사유 생성
+human_reason() {
+    local cls="$1" code="$2" result_file="$3" stderr_file="$4"
+    case "$cls" in
+        TIMEOUT)       echo "⏱️ 실행 시간 초과 (${TIMEOUT}s 초과)" ;;
+        AUTH_ERROR)    echo "🔑 API 인증 오류 — API 키 확인 필요" ;;
+        CONTEXT_TOO_LONG) echo "📄 프롬프트 너무 김 — 컨텍스트 축소 필요" ;;
+        RATE_LIMIT)    echo "🚦 Claude Max 한도 초과 — 자동 리셋 대기" ;;
+        BUDGET_EXCEEDED) echo "💰 API 예산 한도 초과 — cost cap 상향 또는 모델 다운그레이드 필요" ;;
+        EVALUATOR_FAIL) echo "❌ 평가자 검증 실패 — 결과 품질 미달 또는 거부 패턴 감지" ;;
+        NETWORK_ERROR) echo "🌐 네트워크 오류 — 연결 문제 재확인 필요" ;;
+        *)
+            # UNKNOWN: 실제 에러 메시지 한 줄 추출
+            local snippet=""
+            for f in "$result_file" "$stderr_file"; do
+                [[ -f "$f" ]] || continue
+                snippet=$(grep -v '^$' "$f" 2>/dev/null \
+                    | grep -v '^{' \
+                    | tail -1 \
+                    | cut -c1-120)
+                if [[ -n "$snippet" ]]; then break; fi
+            done
+            # result JSON에서 "result" 필드 추출 시도
+            if [[ -z "$snippet" && -f "$result_file" ]]; then
+                snippet=$(grep -o '"result":"[^"]*"' "$result_file" 2>/dev/null \
+                    | head -1 \
+                    | sed 's/"result":"//;s/"$//' \
+                    | cut -c1-120)
+            fi
+            if [[ -n "$snippet" ]]; then
+                echo "❌ 알 수 없는 오류 (exit=$code)\n사유: $snippet"
+            else
+                echo "❌ 알 수 없는 오류 (exit=$code)"
+            fi
+            ;;
+    esac
+}
+
+REASON=$(human_reason "$FAIL_CLASS" "${exit_code:-1}" "$RESULT_TMP" "$STDERR_FILE")
+
+"$BOT_HOME/bin/route-result.sh" alert "$TASK_ID" \
+    "⚠️ $TASK_ID 실패 (재시도 ${MAX_RETRIES}회)\n$REASON"
+
+cat "$RESULT_TMP" >&2
+# quality_fail(빈 output)로 여기까지 왔는데 exit_code=0이면 호출자가 SUCCESS로 잘못 판정함
+# → 명시적 exit 1로 실패 신호 전달 (exit_code가 0인 경우만 강제)
+if [[ "${exit_code:-0}" -eq 0 ]]; then
+    exit_code=1
+fi
+exit "$exit_code"

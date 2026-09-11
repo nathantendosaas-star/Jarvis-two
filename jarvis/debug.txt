@@ -1,0 +1,17 @@
+Detailed Implementation Plan
+1. Fix Dashboard Scrolling & Fullscreen Chatbox Input (src/components/HUDView.tsx)
+Problem: Currently, HUDView.tsx uses overflow-hidden on the parent div, making the dashboard fixed in height and causing parts of the page (and the chatbox input bar in fullscreen mode) to be pushed out of view.
+Solution:
+Change the parent container in HUDView.tsx from overflow-hidden to overflow-y-auto min-h-screen h-full.
+Wrap the bottom chatbox input bar in sticky bottom-0 z-30 bg-[#06070a]/95 backdrop-blur-md border-t border-slate-800/60 p-4 so it stays pinned and visible at the bottom of the screen regardless of screen resolution or fullscreen mode.
+2. Fix Upcoming Milestones Section (src/components/HUDView.tsx & src/components/D3Timeline.tsx)
+Problem: Milestones slide downward out of view because Card 4 in HUDView.tsx uses flex-1 without a fixed height constraint, causing D3's dynamic SVG height observer in D3Timeline.tsx to calculate expanding dimensions on re-renders.
+Solution:
+Give Card 4 in HUDView.tsx an explicit height (h-72 min-h-[280px]) and overflow-hidden.
+Adjust D3 timeline scaling in D3Timeline.tsx (margin.top: 25, centerY = height / 2, height: Math.max(height, 180)) so milestone nodes remain strictly stationary inside the card.
+3. Research Agent & OpenRouter Configuration Check (backend/src/services/ai.py & backend/src/core/config.py)
+Status Check:
+OpenRouter is already configured in backend/src/core/config.py using OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").
+OpenRouter models (deepseek/deepseek-v4-flash and google/gemma-2-27b-it) are supported in backend/src/services/ai.py.
+Research Agent Enforcer:
+In backend/src/services/ai.py, ensure research subagents created during task delegation explicitly default to deepseek/deepseek-v4-flash via OpenRouter.

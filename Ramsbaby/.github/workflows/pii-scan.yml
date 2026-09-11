@@ -1,0 +1,81 @@
+name: Privacy Guard
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# SSoT: scripts/privacy/scan.mjs + .privacy-blocklist.yml
+# 로컬 pre-commit hook과 동일한 바이너리·룰을 사용해
+# "로컬 통과 / CI 실패" 불일치를 구조적으로 제거한다.
+jobs:
+  privacy-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Resolve diff base
+        id: diff
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+            echo "mode=diff" >> "$GITHUB_OUTPUT"
+          else
+            # push 이벤트: 전체 스캔으로 잔존 PII 상태 가시화 (실패시키지 않음 - report only)
+            echo "mode=all" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Privacy scan (PR diff)
+        if: steps.diff.outputs.mode == 'diff'
+        run: |
+          node scripts/privacy/scan.mjs \
+            --diff=${{ steps.diff.outputs.base }}..${{ steps.diff.outputs.head }}
+
+      - name: Privacy scan (push full audit — high+ enforce)
+        if: steps.diff.outputs.mode == 'all'
+        run: |
+          # push to main: critical/high만 차단, medium/low는 경고 출력만 (report-only).
+          # PR diff 스캔이 실질적 게이트 역할. push는 잔존 PII 가시화 목적.
+          node scripts/privacy/scan.mjs --all --min-severity=high || {
+            echo ""
+            echo "🚫 main HEAD 에 critical/high PII 위반 존재 — 추가 커밋 또는 revert 로 해소 필요."
+            echo "ℹ️  blocker 가 과거 커밋에서 유래한 경우 BFG/filter-repo 로 history 정화 계획 수립."
+            exit 1
+          }
+
+      - name: Legacy shape patterns (extra safety net)
+        run: |
+          # 리포 외부 패턴(개인 정보 형태) 방어 — Privacy Guard 룰이 다루지 않는 일반적 PII 형태.
+          PATTERNS=(
+            '010-[0-9]{4}-[0-9]{4}'
+            '[0-9]{6}-[1-4][0-9]{6}'
+            'BEGIN RSA PRIVATE KEY'
+            'BEGIN OPENSSH PRIVATE KEY'
+            'sk-ant-api03-'
+            'ghp_[A-Za-z0-9]{36}'
+            'AKIA[0-9A-Z]{16}'
+          )
+          FOUND=0
+          for pattern in "${PATTERNS[@]}"; do
+            matches=$(git grep -nE "$pattern" -- ':!node_modules' ':!*.lock' ':!.github/workflows/pii-scan.yml' || true)
+            if [[ -n "$matches" ]]; then
+              echo "❌ Shape pattern detected: $pattern"
+              echo "$matches"
+              FOUND=$((FOUND + 1))
+            fi
+          done
+          if [[ $FOUND -gt 0 ]]; then
+            echo ""
+            echo "🚫 Shape PII patterns detected. Block merge."
+            exit 1
+          fi
+          echo "✅ Shape pattern scan clean."

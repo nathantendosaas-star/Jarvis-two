@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo
+# pipefail 제거: SIGPIPE로 인한 조기 종료 방지
+# 파이프라인 내 일부 커맨드 실패 시 앞단 커맨드의 SIGPIPE를 무시
+
+# vault-daily-digest.sh — 일일 다이제스트 자동 생성
+# Usage: crontab에서 매일 23:50 실행
+# 로직: 오늘 수정/생성된 노트를 수집하여 claude -p로 요약 → digest 노트 생성
+
+BOT_HOME="${BOT_HOME:-$HOME/.jarvis}" # ALLOW-DOTJARVIS
+VAULT="${HOME}/Jarvis-Vault"
+LOG_TAG="vault-daily-digest"
+TODAY=$(date '+%Y-%m-%d')
+DIGEST_DIR="$VAULT/02-daily/digest"
+DIGEST_FILE="$DIGEST_DIR/${TODAY}.md"
+
+log() { echo "[$(date '+%F %T')] [${LOG_TAG}] $1"; }
+
+if [[ ! -d "$VAULT" ]]; then
+    log "ERROR: Vault not found at $VAULT"
+    exit 1
+fi
+
+mkdir -p "$DIGEST_DIR"
+
+# 이미 생성된 경우 스킵
+if [[ -f "$DIGEST_FILE" ]]; then
+    log "Digest already exists for $TODAY, skipping"
+    exit 0
+fi
+
+# --- 1. 오늘 수정된 파일 수집 ---
+changed_files=""
+changed_count=0
+
+while IFS= read -r -d '' file; do
+    relpath="${file#$VAULT/}"
+
+    # 메타 파일 스킵
+    case "$relpath" in
+        _templates/*|README.md|.obsidian/*) continue ;;
+        02-daily/digest/*) continue ;;  # 다이제스트 자신은 스킵
+    esac
+
+    # frontmatter의 title 추출
+    title=$(grep -m1 '^title:' "$file" 2>/dev/null | sed 's/^title: *"*//;s/"*$//' || basename "$file" .md)
+
+    # 본문 미리보기 (frontmatter 제외, 첫 200자)
+    # SIGPIPE 방지: cut 대신 printf 사용
+    preview=$(sed '1,/^---$/d' "$file" 2>/dev/null | sed '1{/^$/d;}' | head -5 | tr '\n' ' ' | sed 's/^\(.\{1,200\}\).*/\1/')
+
+    changed_files="${changed_files}
+## [[${relpath%.md}|${title}]]
+${preview}
+"
+    changed_count=$((changed_count + 1))
+done < <(find "$VAULT" -name "*.md" -not -path "*/.obsidian/*" -not -path "*/.git/*" -mtime 0 -print0 2>/dev/null)
+
+if [[ "$changed_count" -eq 0 ]]; then
+    log "No changes today, creating minimal digest"
+    cat > "$DIGEST_FILE" << EOF
+---
+title: "일일 다이제스트 — ${TODAY}"
+tags: [area/daily, type/digest]
+created: ${TODAY}
+updated: ${TODAY}
+---
+
+# 일일 다이제스트 — ${TODAY}
+
+오늘 변경된 노트가 없습니다.
+
+---
+관련: [[Home]] | [[02-daily/_index|데일리]]
+EOF
+    log "Minimal digest created"
+    exit 0
+fi
+
+# --- 2. claude -p로 요약 생성 ---
+# 크론 환경에서 타임아웃 방지: ask-claude.sh 실패 시 직접 claude 호출 시도
+PROMPT="다음은 오늘(${TODAY}) Jarvis Vault에서 변경된 ${changed_count}개 노트의 내용입니다.
+
+${changed_files}
+
+위 내용을 바탕으로 일일 다이제스트를 작성해주세요:
+1. **오늘의 핵심** (1-3줄 요약)
+2. **변경 목록** (각 노트의 핵심 변경 사항 1줄씩)
+3. **주목할 점** (중요한 인사이트나 연결이 있으면)
+
+마크다운으로 작성하되 frontmatter는 제외하세요. 간결하게."
+
+# PATH 보강: cron 환경에서 gtimeout 찾기 위해 homebrew bin 경로 추가
+export PATH="${PATH}:/usr/local/bin:/opt/homebrew/bin"
+
+# ask-claude.sh 시도 (80초 타임아웃으로 제한)
+# 실패해도 대체 방식으로 진행하도록 변경
+STDERR_LOG="${BOT_HOME}/logs/claude-stderr-vault-digest.log"
+SUMMARY=""
+if [[ -x "$BOT_HOME/bin/ask-claude.sh" ]]; then
+    # ask-claude.sh는 stdin을 기대하지 않음. PROMPT는 인자로 전달
+    # Broken pipe 방지: prompt를 파일로 생성해서 전달
+    PROMPT_FILE="/tmp/vault-digest-prompt-$$.txt"
+    printf '%s' "$PROMPT" > "$PROMPT_FILE" 2>/dev/null || true
+
+    # ask-claude.sh 파라미터: TASK_ID PROMPT ALLOWED_TOOLS TIMEOUT MAX_BUDGET RESULT_RETENTION MODEL
+    # 올바른 순서: task_id, prompt, allowed_tools(Read), timeout(60s), max_budget(0.50), retention(1day), model()
+    # 2026-07-19 vault-fix: 7번째 인자로 모델을 Haiku로 고정.
+    #   근본원인: 모델 미지정 → 기본 Opus 라우팅 → 129KB 프롬프트(600+ 변경파일)의 캐시 생성비가
+    #   0.50 예산 초과 → claude가 error_max_budget_usd 반환 → 7일간 무음 실패(폴백 저품질 덤프).
+    #   실측 근거: FAIL-DIAG task=vault-digest subtype=error_max_budget_usd model=opus prompt_bytes~129K.
+    #   Haiku 실측: 동일 규모 프롬프트 cost=$0.226(<0.50) · 14s · 정상 한국어 요약 생성.
+    timeout 80s "$BOT_HOME/bin/ask-claude.sh" "vault-digest" "$PROMPT" "Read" "60" "0.50" "1" "claude-haiku-4-5-20251001" 2>>"$STDERR_LOG" || true
+
+    # 정리
+    rm -f "$PROMPT_FILE" 2>/dev/null || true
+
+    # 결과 파일에서 내용 추출
+    RESULT_DIR="$BOT_HOME/results/vault-digest"
+    if [[ -d "$RESULT_DIR" ]]; then
+        LATEST_RESULT=$(find "$RESULT_DIR" -name "*.md" -type f 2>/dev/null | sort -r | head -1)
+        if [[ -n "$LATEST_RESULT" && -s "$LATEST_RESULT" ]]; then
+            # 2026-07-19 vault-fix: 결과 파일은 '# Task/## Prompt/<129KB 프롬프트>/## Result/<요약>' 구조.
+            #   기존엔 cat으로 전체를 읽어 digest에 프롬프트 원문(129KB)까지 박혀 요약이 묻혔음.
+            #   '## Result' 섹션 이후만 추출해 실제 요약만 남긴다. 추출 실패 시 안전하게 빈 값 → 파일목록 폴백.
+            SUMMARY=$(sed -n '/^## Result$/,$p' "$LATEST_RESULT" 2>/dev/null | sed '1d' || true)
+        fi
+    fi
+fi
+
+# 요약 생성 실패 시 간단한 변경 목록으로 대체
+if [[ -z "$SUMMARY" ]]; then
+    SUMMARY="## 변경된 노트 목록
+
+${changed_files}
+
+_(자동 요약 생성 실패 - 수정된 파일 목록만 표시)_"
+fi
+
+# --- 3. 다이제스트 파일 생성 ---
+cat > "$DIGEST_FILE" << EOF
+---
+title: "일일 다이제스트 — ${TODAY}"
+tags: [area/daily, type/digest]
+created: ${TODAY}
+updated: ${TODAY}
+changes: ${changed_count}
+---
+
+# 일일 다이제스트 — ${TODAY}
+
+> 변경된 노트: ${changed_count}개 | Auto-generated
+
+${SUMMARY}
+
+---
+관련: [[Home]] | [[02-daily/_index|데일리]]
+EOF
+
+log "Digest created: $DIGEST_FILE ($changed_count changes summarized)"
