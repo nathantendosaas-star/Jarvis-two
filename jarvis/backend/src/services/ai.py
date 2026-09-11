@@ -442,8 +442,96 @@ async def _tool_browser_automation(args: Dict[str, Any]) -> str:
         })
 
 
+async def _run_subagent_background_loop(agent_id: str, subagent_name: str, role: str, task: str, allowed_tools: List[str], model_arg: Optional[str]):
+    """Non-blocking background turn execution loop for spawned subagent."""
+    from ..core.database import AsyncSessionLocal
+    from ..services.agent import AgentService
+    from ..schemas.agent import AgentUpdate
+    from pathlib import Path
+
+    async with AsyncSessionLocal() as db:
+        try:
+            ai_service = AIService()
+            system_instr = (
+                f"You are {subagent_name}, a specialized subagent in role: '{role}'. "
+                f"Your specific task is: '{task}'. "
+                "Perform the work diligently using any available tools, and when finished, "
+                "provide a concise, high-quality summary/report of your results."
+            )
+
+            subagent_history = []
+            final_text = ""
+
+            is_research = any(
+                "research" in s.lower() or "search" in s.lower()
+                for s in [role, subagent_name, task]
+            )
+            subagent_model = model_arg if model_arg else ("deepseek/deepseek-v4-flash" if is_research else "gemini-3.1-flash-lite")
+
+            if is_research:
+                try:
+                    specs_dir = Path("Cached/research_specs")
+                    specs_dir.mkdir(parents=True, exist_ok=True)
+                    spec_path = specs_dir / f"{agent_id[:8]}_spec.md"
+                    ceo_spec_chunks = []
+                    async for chunk in ai_service.stream_chat(
+                        message=f"Create a structured Research Spec for task: '{task}' with objectives, investigation vectors, and expected deliverables.",
+                        history=[],
+                        system_instruction="You are the JARVIS CEO Orchestrator generating high-level structured specifications.",
+                        model="gemini-3.1-flash-lite",
+                        db=db
+                    ):
+                        if "text" in chunk:
+                            ceo_spec_chunks.append(chunk["text"])
+                    spec_content = "".join(ceo_spec_chunks)
+                    spec_path.write_text(spec_content, encoding="utf-8")
+                    system_instr += f"\n\n=== CEO RESEARCH SPECIFICATION ===\n{spec_content}\n=================================="
+                except Exception:
+                    pass
+
+            for turn in range(5):
+                response_chunks = []
+                async for chunk in ai_service.stream_chat(
+                    message=task if turn == 0 else f"Please proceed with the next step to complete: '{task}'.",
+                    history=subagent_history,
+                    system_instruction=system_instr,
+                    model=subagent_model,
+                    db=db
+                ):
+                    if "text" in chunk:
+                        response_chunks.append(chunk["text"])
+
+                turn_response = "".join(response_chunks)
+                subagent_history.append({"role": "user", "content": f"Turn {turn+1} input"})
+                subagent_history.append({"role": "model", "content": turn_response})
+                final_text = turn_response
+
+            reports_dir = Path("Cached/reports")
+            reports_dir.mkdir(parents=True, exist_ok=True)
+            report_path = reports_dir / f"{agent_id[:8]}_report.md"
+            report_path.write_text(final_text, encoding="utf-8")
+
+            await AgentService.update_agent(db, agent_id, AgentUpdate(
+                status="idle",
+                current_task=None,
+                activity=[
+                    f"Completed delegation task: {task[:60]}.",
+                    f"Report generated: {final_text[:100]}..."
+                ]
+            ))
+        except Exception as e:
+            try:
+                await AgentService.update_agent(db, agent_id, AgentUpdate(
+                    status="idle",
+                    current_task=None,
+                    activity=[f"Failed during background task execution: {e}"]
+                ))
+            except Exception:
+                pass
+
+
 async def _tool_delegate_task(db: AsyncSession, args: Dict[str, Any]) -> str:
-    """Antigravity 2.0 Agentic Delegation Loop."""
+    """Antigravity 2.0 Non-Blocking Agentic Delegation Launcher."""
     from ..schemas.agent import AgentCreate
     from ..services.agent import AgentService
 
@@ -451,6 +539,7 @@ async def _tool_delegate_task(db: AsyncSession, args: Dict[str, Any]) -> str:
     role = args.get("role", "Specialist")
     task = args.get("task", "")
     allowed_tools = args.get("tools", [])
+    model_arg = args.get("model")
 
     if not task:
         return json.dumps({"success": False, "error": "task description is required for delegation."})
@@ -469,94 +558,22 @@ async def _tool_delegate_task(db: AsyncSession, args: Dict[str, Any]) -> str:
 
     agent_record = await AgentService.create_agent(db, agent_data)
 
-    try:
-        ai_service = AIService()
-        system_instr = (
-            f"You are {subagent_name}, a specialized subagent in role: '{role}'. "
-            f"Your specific task is: '{task}'. "
-            "Perform the work diligently using any available tools, and when finished, "
-            "provide a concise, high-quality summary/report of your results."
-        )
+    asyncio.create_task(_run_subagent_background_loop(
+        agent_id=agent_record.id,
+        subagent_name=subagent_name,
+        role=role,
+        task=task,
+        allowed_tools=allowed_tools,
+        model_arg=model_arg
+    ))
 
-        subagent_history = []
-        final_text = ""
-
-        # Research Agent Enforcer: research subagents explicitly default to deepseek/deepseek-v4-flash via OpenRouter
-        is_research = any(
-            "research" in s.lower() or "search" in s.lower()
-            for s in [role, subagent_name, task]
-        )
-        model_arg = args.get("model")
-        subagent_model = model_arg if model_arg else ("deepseek/deepseek-v4-flash" if is_research else "gemini-3.1-flash-lite")
-
-        # Stage 1 for Research: Generate CEO Research Spec
-        if is_research:
-            try:
-                from pathlib import Path
-                specs_dir = Path("Cached/research_specs")
-                specs_dir.mkdir(parents=True, exist_ok=True)
-                spec_path = specs_dir / f"{agent_record.id[:8]}_spec.md"
-                ceo_spec_chunks = []
-                async for chunk in ai_service.stream_chat(
-                    message=f"Create a structured Research Spec for task: '{task}' with objectives, investigation vectors, and expected deliverables.",
-                    history=[],
-                    system_instruction="You are the JARVIS CEO Orchestrator generating high-level structured specifications.",
-                    model="gemini-3.1-flash-lite",
-                    db=db
-                ):
-                    if "text" in chunk:
-                        ceo_spec_chunks.append(chunk["text"])
-                spec_content = "".join(ceo_spec_chunks)
-                spec_path.write_text(spec_content, encoding="utf-8")
-                system_instr += f"\n\n=== CEO RESEARCH SPECIFICATION ===\n{spec_content}\n=================================="
-            except Exception:
-                pass
-
-        for turn in range(5):
-            response_chunks = []
-            async for chunk in ai_service.stream_chat(
-                message=task if turn == 0 else f"Please proceed with the next step to complete: '{task}'.",
-                history=subagent_history,
-                system_instruction=system_instr,
-                model=subagent_model,
-                db=db
-            ):
-                if "text" in chunk:
-                    response_chunks.append(chunk["text"])
-
-            turn_response = "".join(response_chunks)
-            subagent_history.append({"role": "user", "content": f"Turn {turn+1} input"})
-            subagent_history.append({"role": "model", "content": turn_response})
-            final_text = turn_response
-
-        from ..schemas.agent import AgentUpdate
-        await AgentService.update_agent(db, agent_record.id, AgentUpdate(
-            status="idle",
-            current_task=None,
-            activity=[
-                f"Completed delegation task: {task[:60]}.",
-                f"Report generated: {final_text[:100]}..."
-            ]
-        ))
-
-        return json.dumps({
-            "success": True,
-            "subagent_id": agent_record.id,
-            "subagent_name": subagent_name,
-            "report": final_text
-        })
-
-    except Exception as e:
-        try:
-            from ..schemas.agent import AgentUpdate
-            await AgentService.update_agent(db, agent_record.id, AgentUpdate(
-                status="idle",
-                current_task=None,
-                activity=[f"Failed during task delegation: {e}"]
-            ))
-        except:
-            pass
-        return json.dumps({"success": False, "error": str(e)})
+    return json.dumps({
+        "success": True,
+        "status": "spawned_and_running",
+        "subagent_id": agent_record.id,
+        "subagent_name": subagent_name,
+        "message": f"Subagent '{subagent_name}' ({role}) spawned successfully and is running task asynchronously."
+    })
 
 
 async def _tool_send_marketing_email(args: Dict[str, Any]) -> str:

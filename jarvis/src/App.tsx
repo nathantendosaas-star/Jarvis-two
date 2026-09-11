@@ -2,6 +2,7 @@ import React, { Suspense, lazy, useState, useEffect, useRef } from "react";
 import Sidebar from "./components/Sidebar";
 import TopBar from "./components/TopBar";
 import HUDView from "./components/HUDView";
+import ThreeOrbView from "./components/ThreeOrbView";
 import CommandPalette from "./components/CommandPalette";
 import VoiceSync from "./components/VoiceSync";
 import { fetchWorkspaceData, fetchWorkspaceFiles, fetchAgents, updateAgent as apiUpdateAgent, deleteAgent as apiDeleteAgent, createAgent as apiCreateAgent } from "./api";
@@ -339,22 +340,27 @@ export default function App() {
 
       {/* Main viewport area */}
       <div className="flex-1 flex flex-col h-screen overflow-hidden z-10 relative">
-        {/* Top telemetry bar */}
-        <TopBar
-          currentView={currentView}
-          activeProjectName={getActiveProjectName()}
-          selectedModel={selectedModel}
-          setSelectedModel={setSelectedModel}
-          notifications={notifications}
-          toggleCommandPalette={toggleCommandPalette}
-          toggleVoiceOrb={toggleVoiceOrb}
-          theme={theme}
-          toggleTheme={toggleTheme}
-          metrics={systemMetrics}
-          unreadCount={unreadCount}
-          setNotifications={setNotifications}
-          toggleMobileMenu={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
-        />
+        {/* Top telemetry bar with integrated 3D Particle Orb */}
+        <div className="flex items-center justify-between border-b border-slate-800 bg-slate-900/60 px-4">
+          <ThreeOrbView isSpeaking={isMicActive} activeAgentsCount={systemMetrics.activeAgents} />
+          <div className="flex-1">
+            <TopBar
+              currentView={currentView}
+              activeProjectName={getActiveProjectName()}
+              selectedModel={selectedModel}
+              setSelectedModel={setSelectedModel}
+              notifications={notifications}
+              toggleCommandPalette={toggleCommandPalette}
+              toggleVoiceOrb={toggleVoiceOrb}
+              theme={theme}
+              toggleTheme={toggleTheme}
+              metrics={systemMetrics}
+              unreadCount={unreadCount}
+              setNotifications={setNotifications}
+              toggleMobileMenu={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+            />
+          </div>
+        </div>
 
         {/* Dynamic workspace viewport routing */}
         <main className="flex-1 overflow-hidden flex flex-col">
